@@ -1,0 +1,32 @@
+[package]
+name = "talpid-routing"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Library for managing routing tables"
+repository = "https://github.com/mullvad/mullvadvpn-app/"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+futures = "0.3.34"
+ipnetwork = "0.21.1"
+log = "0.4"
+talpid-types = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "16c2f486e79d0579225b65b55e57fb1f9c8df7a2" }
+thiserror = "2.0"
+tokio = { version = "1.53", features = [
+  "io-util",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "time"
+] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bitflags = "2"
+libc = "0.2"
+nix = { version = "0.31.3", features = ["fs", "net", "socket"] }
+system-configuration = "0.8.0"

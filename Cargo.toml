@@ -1,0 +1,50 @@
+[package]
+name = "simplevpn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+description = "A multi-profile WireGuard-compatible VPN supervisor for Apple Silicon macOS"
+publish = false
+
+[workspace]
+members = ["vendor/talpid-routing"]
+resolver = "2"
+
+[dependencies]
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = "1.9.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gotatun = { version = "=0.9.2", default-features = false, features = ["ring", "device", "tun"] }
+pfctl = "=0.7.0"
+system-configuration = "0.8.0"
+talpid-dns = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "16c2f486e79d0579225b65b55e57fb1f9c8df7a2" }
+talpid-routing = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "16c2f486e79d0579225b65b55e57fb1f9c8df7a2" }
+
+[patch."https://github.com/mullvad/mullvadvpn-app.git"]
+talpid-routing = { path = "vendor/talpid-routing" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

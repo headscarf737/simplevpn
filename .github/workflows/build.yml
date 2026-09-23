@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CLI and macOS application (Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up the pinned Rust toolchain
+        # rustup installs the toolchain and target from rust-toolchain.toml.
+        run: rustup show
+
+      - name: Build CLI and application
+        run: ./scripts/build-macos-app.sh
+
+      - name: Verify build outputs
+        run: |
+          target/aarch64-apple-darwin/release/simplevpn --help
+          target/macos/SimpleVPN.app/Contents/Helpers/simplevpn --help
+          codesign --verify --deep --strict target/macos/SimpleVPN.app
+
+      - name: Package CLI and application
+        # Archive before uploading to preserve executable permissions and the app bundle.
+        run: |
+          mkdir -p target/artifacts
+          tar -czf target/artifacts/simplevpn-macos-arm64.tar.gz \
+            -C target/aarch64-apple-darwin/release simplevpn
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/macos/SimpleVPN.app target/artifacts/SimpleVPN-macos-arm64.zip
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v7
+        with:
+          path: target/artifacts/simplevpn-macos-arm64.tar.gz
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload application
+        uses: actions/upload-artifact@v7
+        with:
+          path: target/artifacts/SimpleVPN-macos-arm64.zip
+          archive: false
+          if-no-files-found: error

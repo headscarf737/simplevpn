@@ -1,0 +1,7 @@
+/target/
+/macos/.build/
+/macos/.swiftpm/
+/vendor/**/target/
+/.toolchain/
+*.log
+.DS_Store

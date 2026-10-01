@@ -12,6 +12,10 @@ use tokio::net::lookup_host;
 use crate::{AppError, Result, config::Profile, planner::ActiveProfile};
 
 use super::verify;
+use crate::supervisor::{
+    operations::{Failure, OperationResult},
+    state::FailureStage,
+};
 
 pub struct Tunnel {
     profile: Profile,
@@ -21,26 +25,43 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub async fn start(profile: Profile) -> Result<Self> {
+    pub async fn start(
+        profile: Profile,
+        pending_interfaces: &mut Vec<String>,
+    ) -> OperationResult<Self> {
         tracing::info!(profile = %profile.name, "starting tunnel");
         let mut endpoints = Vec::with_capacity(profile.peers.len());
         for peer in &profile.peers {
-            endpoints.push(resolve_endpoint(&peer.endpoint).await?);
+            endpoints.push(
+                resolve_endpoint(&peer.endpoint)
+                    .await
+                    .map_err(Failure::at(FailureStage::Interface))?,
+            );
         }
 
         let tun = TunDevice::from_name("utun")
-            .map_err(|error| AppError::Platform(format!("cannot create GotaTun utun: {error}")))?;
-        let interface = tun.name().map_err(|error| {
-            AppError::Platform(format!("cannot obtain GotaTun interface name: {error}"))
-        })?;
+            .map_err(|error| AppError::Platform(format!("cannot create GotaTun utun: {error}")))
+            .map_err(Failure::at(FailureStage::Interface))?;
+        let interface = tun
+            .name()
+            .map_err(|error| {
+                AppError::Platform(format!("cannot obtain GotaTun interface name: {error}"))
+            })
+            .map_err(Failure::at(FailureStage::Interface))?;
         tracing::info!(%interface, "configuring tunnel interface");
         if let Err(error) = configure_interface(&interface, &profile).await {
             drop(tun);
             return match verify::verify_interface_removed(&interface).await {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(AppError::Runtime(format!(
-                    "{error}; interface cleanup also failed: {cleanup_error}"
-                ))),
+                Ok(()) => Err(Failure::new(FailureStage::Interface, error)),
+                Err(cleanup_error) => {
+                    pending_interfaces.push(interface.clone());
+                    Err(Failure::new(
+                        FailureStage::Cleanup,
+                        AppError::Runtime(format!(
+                            "{error}; interface cleanup also failed: {cleanup_error}"
+                        )),
+                    ))
+                }
             };
         }
 
@@ -70,10 +91,16 @@ impl Tunnel {
             Err(error) => {
                 let error = AppError::Runtime(format!("cannot start GotaTun device: {error}"));
                 return match verify::verify_interface_removed(&interface).await {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(AppError::Runtime(format!(
-                        "{error}; interface cleanup also failed: {cleanup_error}"
-                    ))),
+                    Ok(()) => Err(Failure::new(FailureStage::Interface, error)),
+                    Err(cleanup_error) => {
+                        pending_interfaces.push(interface.clone());
+                        Err(Failure::new(
+                            FailureStage::Cleanup,
+                            AppError::Runtime(format!(
+                                "{error}; interface cleanup also failed: {cleanup_error}"
+                            )),
+                        ))
+                    }
                 };
             }
         };
@@ -109,7 +136,7 @@ impl Tunnel {
         }
     }
 
-    pub async fn stop(mut self) -> Result<()> {
+    pub async fn stop(&mut self) -> Result<()> {
         if let Some(device) = self.device.take() {
             device.stop().await;
         }

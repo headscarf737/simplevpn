@@ -28,17 +28,24 @@ public final class MenuController {
 
   public var rows: [ProfileRow] { ProfileDiscovery.rows(files: files, status: status) }
   public var canToggle: Bool {
-    !isBusy && status != nil && statusError == nil && status?.recoveryPending == false
+    !isBusy && status != nil && statusError == nil && status?.profileChangesAllowed == true
   }
   public var canDisconnectAll: Bool {
     !isBusy && statusError == nil
-      && (status?.profiles.isEmpty == false || status?.recoveryPending == true)
+      && (status?.profiles.isEmpty == false || status?.requiresRecovery == true)
   }
   public var summary: String {
     if isBusy { return "Updating VPN…" }
     if statusError != nil { return "VPN status unavailable" }
     guard let status else { return "Loading VPN status…" }
-    if status.recoveryPending { return "Recovery required — use Disconnect All" }
+    if status.networkStatus?.state == .blocked {
+      return "Protection could not be verified — retrying…"
+    }
+    if status.requiresRecovery { return "Recovery required — use Disconnect All" }
+    if status.networkStatus?.state == .recovering { return "Reconnecting VPN…" }
+    if status.networkStatus?.state == .applying || status.networkStatus?.state == .disconnecting {
+      return "Updating VPN…"
+    }
     if status.profiles.contains(where: { $0.state == .reconnecting }) {
       return "Reconnecting VPN…"
     }
@@ -122,7 +129,9 @@ public final class MenuController {
     case .success(let status):
       self.status = status
       statusError = nil
-    case .failure(let error): statusError = error.localizedDescription
+    case .failure(let error):
+      status = nil
+      statusError = error.localizedDescription
     }
   }
 

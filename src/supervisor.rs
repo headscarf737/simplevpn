@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(target_os = "macos")]
-mod route_refresh;
+pub(crate) mod operations;
+pub(crate) mod state;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -22,7 +23,10 @@ mod macos {
         time::{Instant, sleep_until},
     };
 
-    use super::route_refresh::RouteRefresh;
+    use super::{
+        operations::{Failure, NetworkOperations, OperationResult},
+        state::{Effect, Event as StateEvent, FailureStage, Machine, State},
+    };
     use crate::{
         AppError, Result,
         config::Profile,
@@ -32,7 +36,7 @@ mod macos {
         planner::{
             ActiveProfile, AggregatePlan, PlannedRoute, RoutePurpose, aggregate, validate_candidate,
         },
-        platform::{MacRuntime, Tunnel},
+        platform::MacRuntime,
         status::{StatusReport, write_atomic},
     };
 
@@ -104,16 +108,17 @@ mod macos {
         let listener = bind_listener(socket_path)?;
         let store = JournalStore::new(journal_path);
         let loaded = store.load()?.unwrap_or_else(RecoveryJournal::clean);
-        let stale_recovery = loaded.dirty;
+        let machine = Machine::new(loaded.dirty);
         let runtime = MacRuntime::new().await?;
         let mut supervisor = Supervisor {
             runtime,
             tunnels: HashMap::new(),
+            pending_cleanup: Vec::new(),
+            cleanup_guard: None,
             journal_store: store,
             journal: loaded,
             status_path,
-            stale_recovery,
-            route_refresh: RouteRefresh::default(),
+            machine,
         };
         supervisor.publish_status()?;
         tracing::info!("supervisor initialized");
@@ -142,14 +147,17 @@ mod macos {
                 Idle,
             }
             let event = tokio::select! {
-                connection = listener.accept() => Event::Connection(connection),
+                biased;
+                _ = interrupt.recv() => Event::Signal,
+                _ = terminate.recv() => Event::Signal,
+                // Queued commands get a turn between recovery attempts. A due
+                // attempt also precedes new notifications to prevent starvation.
                 Some(request) = request_rx.recv() => Event::Request(request),
+                () = sleep_until(supervisor.machine.deadline().unwrap_or_else(Instant::now)), if supervisor.machine.deadline().is_some() => Event::RefreshRoutes,
+                connection = listener.accept() => Event::Connection(connection),
                 Some(_) = clients.join_next(), if !clients.is_empty() => Event::ClientFinished,
                 _ = session_changes.changed() => Event::SessionsChanged,
                 Some(()) = supervisor.runtime.route_changed() => Event::RouteChange,
-                () = sleep_until(supervisor.route_refresh.deadline().unwrap_or_else(Instant::now)), if supervisor.route_refresh.deadline().is_some() => Event::RefreshRoutes,
-                _ = interrupt.recv() => Event::Signal,
-                _ = terminate.recv() => Event::Signal,
                 () = sleep_until(lifetime.idle_deadline.unwrap_or_else(Instant::now)), if lifetime.idle_deadline.is_some() => Event::Idle,
             };
             match event {
@@ -184,7 +192,7 @@ mod macos {
                         vpn_change,
                         succeeded,
                         !supervisor.tunnels.is_empty(),
-                        supervisor.stale_recovery,
+                        supervisor.machine.recovery_pending(),
                         sessions.active(),
                     ) {
                         break;
@@ -195,19 +203,20 @@ mod macos {
                     if lifetime.sessions_changed(
                         !supervisor.tunnels.is_empty(),
                         sessions.active(),
-                        supervisor.stale_recovery,
+                        supervisor.machine.recovery_pending(),
                     ) {
                         break;
                     }
                 }
                 Event::RouteChange => {
-                    if !supervisor.tunnels.is_empty() && !supervisor.stale_recovery {
-                        supervisor.route_refresh.request(Instant::now());
+                    supervisor.event(StateEvent::NetworkChanged);
+                    if let Err(error) = supervisor.publish_status() {
+                        tracing::error!(%error, "cannot publish network change status");
                     }
                 }
                 Event::RefreshRoutes => supervisor.refresh_routes().await,
                 Event::Signal => {
-                    if !supervisor.tunnels.is_empty()
+                    if supervisor.has_resources()
                         && let Err(error) = supervisor.down_all().await
                     {
                         tracing::error!(%error, "clean signal teardown failed");
@@ -229,7 +238,10 @@ mod macos {
         sessions.stop();
         drop(request_rx);
         while clients.join_next().await.is_some() {}
-        supervisor.runtime.stop().await?;
+        supervisor
+            .runtime
+            .stop(matches!(supervisor.machine.state, State::Idle) && !supervisor.journal.dirty)
+            .await?;
         if let Err(error) = fs::remove_file(socket_path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -357,17 +369,18 @@ mod macos {
         }
     }
 
-    struct Supervisor<'a> {
-        runtime: MacRuntime,
-        tunnels: HashMap<String, Tunnel>,
+    struct Supervisor<'a, R: NetworkOperations> {
+        runtime: R,
+        tunnels: HashMap<String, R::Tunnel>,
+        pending_cleanup: Vec<R::Tunnel>,
+        cleanup_guard: Option<FirewallPlan>,
         journal_store: JournalStore,
         journal: RecoveryJournal,
         status_path: &'a Path,
-        stale_recovery: bool,
-        route_refresh: RouteRefresh,
+        machine: Machine,
     }
 
-    impl Supervisor<'_> {
+    impl<R: NetworkOperations> Supervisor<'_, R> {
         async fn dispatch(
             &mut self,
             request: Request,
@@ -414,93 +427,169 @@ mod macos {
             }
         }
 
+        fn event(&mut self, event: StateEvent) -> Effect {
+            self.machine.transition(event, self.runtime.now())
+        }
+
+        fn failed(&mut self, failure: Failure) -> AppError {
+            tracing::warn!(stage = ?failure.stage, "supervisor operation failed");
+            self.event(StateEvent::Failed(failure.stage));
+            if let Err(error) = self.publish_status() {
+                tracing::error!(%error, "cannot publish failed transition status");
+            }
+            failure.error
+        }
+
+        fn begin(&mut self, event: StateEvent) -> Result<()> {
+            if self.event(event) == Effect::Reject {
+                return Err(AppError::Runtime(
+                    "recovery pending; use down --all".to_owned(),
+                ));
+            }
+            // A cache publication failure must not strand an Applying state.
+            if let Err(error) = self.publish_status() {
+                tracing::error!(%error, "cannot publish transition status");
+            }
+            Ok(())
+        }
+
         async fn up(&mut self, profile: Profile) -> Result<()> {
-            let recovering = self.stale_recovery;
-            self.recover_if_needed().await?;
-            if self.tunnels.is_empty() && !recovering {
-                self.runtime.cleanup_orphaned_firewall()?;
+            // Preserve CLI startup recovery, but never replace live resources
+            // while their cleanup or protection is unresolved.
+            if self.machine.recovery_required() && !self.has_resources() {
+                self.down_all().await?;
             }
-            let tunnel = Tunnel::start(profile).await?;
-            let candidate = tunnel.active_profile();
+            self.begin(StateEvent::Apply)?;
             let old_active = self.active_profiles();
-            if let Err(error) = validate_candidate(&old_active, &candidate) {
-                return match tunnel.stop().await {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(AppError::Runtime(format!(
-                        "{error}; interface cleanup also failed: {cleanup_error}"
-                    ))),
-                };
-            }
             let old_plan = aggregate(&old_active);
             let old_firewall = generate_firewall(&old_active, &old_plan);
-            let mut new_active = old_active.clone();
-            new_active.push(candidate.clone());
+            self.prepare_transition(&old_plan, profile.dns.is_some())
+                .map_err(|failure| self.failed(failure))?;
+            if self.tunnels.is_empty() {
+                self.runtime
+                    .cleanup_orphaned_firewall()
+                    .map_err(Failure::at(FailureStage::Cleanup))
+                    .map_err(|failure| self.failed(failure))?;
+            }
+            let mut tunnel = match self.runtime.start_tunnel(profile).await {
+                Ok(tunnel) => tunnel,
+                Err(failure) => {
+                    return Err(self
+                        .failed_request(failure, &old_active, None, &old_firewall)
+                        .await);
+                }
+            };
+            let candidate = R::active_profile(&tunnel);
+            if let Err(error) = validate_candidate(&old_active, &candidate) {
+                if let Err(cleanup) = self.runtime.stop_tunnel(&mut tunnel).await {
+                    self.pending_cleanup.push(tunnel);
+                    return Err(self.failed(Failure::new(
+                        FailureStage::Cleanup,
+                        AppError::Runtime(format!(
+                            "{error}; interface cleanup also failed: {cleanup}"
+                        )),
+                    )));
+                }
+                return Err(self
+                    .failed_request(
+                        Failure::new(FailureStage::Interface, error),
+                        &old_active,
+                        None,
+                        &old_firewall,
+                    )
+                    .await);
+            }
+            self.tunnels.insert(candidate.name.clone(), tunnel);
+            let new_active = self.active_profiles();
             let new_plan = aggregate(&new_active);
             let new_firewall = generate_firewall(&new_active, &new_plan);
-
-            self.prepare_transition(&old_plan, new_plan.dns.is_some())?;
             self.journal.stage = TransitionStage::Interface;
-            self.journal_store.save(&self.journal)?;
-            self.tunnels.insert(candidate.name.clone(), tunnel);
-
-            let endpoint_stage = endpoint_stage(&old_plan, &new_plan);
+            // Journal failures leave resources owned for explicit cleanup.
+            self.save_journal()
+                .map_err(|failure| self.failed(failure))?;
             let result = self
-                .apply_transition(&endpoint_stage, &new_plan, &new_firewall)
+                .apply_transition(
+                    &endpoint_stage(&old_plan, &new_plan),
+                    &new_plan,
+                    &new_firewall,
+                )
                 .await;
-            if let Err(error) = result {
-                let tunnel = self.tunnels.remove(&candidate.name);
-                let rollback = self.rollback(&old_plan, &old_firewall, &old_active).await;
-                let tunnel_cleanup = if let Some(tunnel) = tunnel {
-                    tunnel.stop().await
-                } else {
-                    Ok(())
-                };
-                if rollback.is_err() || tunnel_cleanup.is_err() {
-                    self.stale_recovery = true;
-                }
-                self.publish_status()?;
-                return match (rollback, tunnel_cleanup) {
-                    (Ok(()), Ok(())) => Err(error),
-                    (rollback, cleanup) => {
-                        let mut failures = vec![error.to_string()];
-                        if let Err(rollback_error) = rollback {
-                            failures.push(format!("rollback also failed: {rollback_error}"));
-                        }
-                        if let Err(cleanup_error) = cleanup {
-                            failures
-                                .push(format!("interface cleanup also failed: {cleanup_error}"));
-                        }
-                        Err(AppError::Runtime(failures.join("; ")))
-                    }
-                };
+            if let Err(failure) = result {
+                return Err(self
+                    .failed_request(failure, &old_active, Some(&candidate.name), &new_firewall)
+                    .await);
             }
-            self.stale_recovery = false;
-            self.route_refresh.clear();
+            self.finish_transition(&new_active, &new_firewall)
+                .map_err(|failure| self.failed(failure))?;
             self.publish_status()
         }
 
         async fn down(&mut self, name: &str) -> Result<()> {
+            if self.machine.recovery_pending() {
+                return Err(AppError::Runtime(
+                    "recovery pending; use down --all".to_owned(),
+                ));
+            }
             if !self.tunnels.contains_key(name) {
                 return Err(AppError::UnknownProfile(name.to_owned()));
             }
+            self.begin(StateEvent::Disconnect)?;
             self.transition_down(&[name.to_owned()]).await
         }
 
         async fn down_all(&mut self) -> Result<()> {
-            if self.tunnels.is_empty() {
-                let recovering = self.stale_recovery;
-                self.recover_if_needed().await?;
-                if !recovering {
-                    self.runtime.cleanup_orphaned_firewall()?;
-                }
-                self.journal = RecoveryJournal::clean();
-                self.journal_store.save(&self.journal)?;
-                self.route_refresh.clear();
-                self.publish_status()?;
-                return Ok(());
+            let needs_recovery = self.machine.recovery_required();
+            self.begin(StateEvent::DisconnectAll)?;
+            let result = if needs_recovery || self.tunnels.is_empty() {
+                self.cleanup_recorded().await
+            } else {
+                let names: Vec<_> = self.tunnels.keys().cloned().collect();
+                self.transition_down(&names).await
+            };
+            if result.is_err() {
+                // Disconnect All never schedules a retry. Preserve an already
+                // verified rollback and the original failure classification.
+                self.event(StateEvent::StopAutomaticRecovery);
+                let _ = self.publish_status();
             }
-            let names: Vec<_> = self.tunnels.keys().cloned().collect();
-            self.transition_down(&names).await
+            result
+        }
+
+        async fn cleanup_recorded(&mut self) -> Result<()> {
+            let mut active = self.active_profiles();
+            active.extend(self.pending_cleanup.iter().map(R::active_profile));
+            let guard = self
+                .cleanup_guard
+                .clone()
+                .unwrap_or_else(|| generate_firewall(&active, &aggregate(&active)));
+            self.journal.dirty = true;
+            self.save_journal()
+                .map_err(|failure| self.failed(failure))?;
+            self.runtime
+                .recover_stale(&self.journal)
+                .await
+                .map_err(Failure::at(FailureStage::Cleanup))
+                .map_err(|failure| self.failed(failure))?;
+            self.stop_profiles(&self.tunnels.keys().cloned().collect::<Vec<_>>())
+                .await
+                .map_err(|failure| self.failed(failure))?;
+            let cleanup = self
+                .runtime
+                .cleanup_recovered_firewall(&self.journal)
+                .map_err(Failure::at(FailureStage::Cleanup))
+                .and_then(|()| {
+                    self.event(StateEvent::ProtectionVerified { required: false });
+                    self.commit_journal(RecoveryJournal::clean())
+                });
+            if let Err(failure) = cleanup {
+                self.restore_cleanup_guard(&guard);
+                return Err(self.failed(failure));
+            }
+            self.cleanup_guard = None;
+            self.event(StateEvent::Complete {
+                has_profiles: false,
+            });
+            self.publish_status()
         }
 
         async fn transition_down(&mut self, names: &[String]) -> Result<()> {
@@ -514,123 +603,222 @@ mod macos {
                 .collect();
             let new_plan = aggregate(&new_active);
             let new_firewall = generate_firewall(&new_active, &new_plan);
-            self.prepare_transition(&old_plan, new_plan.dns.is_some())?;
-            let endpoint_stage = endpoint_stage(&old_plan, &new_plan);
-            let result = self
-                .apply_transition(&endpoint_stage, &new_plan, &new_firewall)
-                .await;
-            if let Err(error) = result {
-                let rollback = self.rollback(&old_plan, &old_firewall, &old_active).await;
-                self.publish_status()?;
-                return match rollback {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(AppError::Runtime(format!(
-                        "{error}; rollback also failed: {rollback_error}"
-                    ))),
-                };
+            self.prepare_transition(&old_plan, new_plan.dns.is_some())
+                .map_err(|failure| self.failed(failure))?;
+            // Keep the old protection, including a removed full-tunnel policy,
+            // until route/DNS restoration and every requested tunnel stop pass.
+            let guard = &old_firewall;
+            if let Err(failure) = self
+                .apply_transition(&endpoint_stage(&old_plan, &new_plan), &new_plan, guard)
+                .await
+            {
+                return Err(self
+                    .failed_request(failure, &old_active, None, &old_firewall)
+                    .await);
             }
-            let mut stop_errors = Vec::new();
+            if let Err(failure) = self.stop_profiles(names).await {
+                self.cleanup_guard = Some(old_firewall.clone());
+                return Err(self.failed(failure));
+            }
+            if !new_active.is_empty() {
+                self.apply_journaled_firewall(&new_firewall)
+                    .map_err(|failure| self.failed(failure))?;
+            }
+            self.finish_transition(&new_active, guard)
+                .map_err(|failure| self.failed(failure))?;
+            self.publish_status()
+        }
+
+        async fn stop_profiles(&mut self, names: &[String]) -> OperationResult {
+            let mut errors = Vec::new();
+            let mut pending = std::mem::take(&mut self.pending_cleanup);
             for name in names {
-                if let Some(tunnel) = self.tunnels.remove(name)
-                    && let Err(error) = tunnel.stop().await
-                {
-                    stop_errors.push(error.to_string());
+                if let Some(tunnel) = self.tunnels.remove(name) {
+                    pending.push(tunnel);
                 }
             }
-            if !stop_errors.is_empty() {
-                return Err(AppError::Runtime(stop_errors.join("; ")));
+            for mut tunnel in pending {
+                if let Err(error) = self.runtime.stop_tunnel(&mut tunnel).await {
+                    errors.push(error.to_string());
+                    self.pending_cleanup.push(tunnel);
+                }
             }
-            if self.tunnels.is_empty() {
-                self.journal = RecoveryJournal::clean();
-                self.journal_store.save(&self.journal)?;
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(Failure::new(
+                    FailureStage::Cleanup,
+                    AppError::Runtime(errors.join("; ")),
+                ))
             }
-            self.stale_recovery = false;
-            self.route_refresh.clear();
-            self.publish_status()
         }
 
         async fn apply_transition(
             &mut self,
-            endpoint_stage: &[PlannedRoute],
+            endpoints: &[PlannedRoute],
             plan: &AggregatePlan,
-            firewall: &FirewallPlan,
-        ) -> Result<()> {
-            self.runtime.prepare_routes(endpoint_stage).await?;
-            // Install protection (and evict bypassing states) before any route
-            // mutation. A crash or failed route update must leave the guard up.
-            // Removing the final policy is deferred until routes and DNS reset.
-            if firewall.is_active() {
-                self.apply_journaled_firewall(firewall)?;
+            guard: &FirewallPlan,
+        ) -> OperationResult {
+            if guard.is_active() {
+                self.apply_journaled_firewall(guard)?;
             }
-            self.journal.stage = TransitionStage::EndpointRoutes;
-            self.journal.record_routes(endpoint_stage);
-            self.journal_store.save(&self.journal)?;
-            self.runtime.apply_routes(endpoint_stage).await?;
-
-            self.runtime.prepare_routes(&plan.routes).await?;
-            self.journal.stage = TransitionStage::AggregateRoutes;
-            self.journal.record_routes(&plan.routes);
-            self.journal_store.save(&self.journal)?;
-            self.runtime.apply_routes(&plan.routes).await?;
-
+            self.apply_recorded_routes(endpoints, TransitionStage::EndpointRoutes)
+                .await?;
+            self.apply_recorded_routes(&plan.routes, TransitionStage::AggregateRoutes)
+                .await?;
             self.journal.stage = TransitionStage::Dns;
-            self.journal_store.save(&self.journal)?;
-            self.runtime.apply_dns(plan)?;
-            if !firewall.is_active() {
-                self.apply_journaled_firewall(firewall)?;
-            }
-            Ok(())
+            self.save_journal()?;
+            self.runtime
+                .apply_dns(plan)
+                .map_err(Failure::at(FailureStage::Dns))
         }
 
-        fn apply_journaled_firewall(&mut self, firewall: &FirewallPlan) -> Result<()> {
-            self.runtime.prepare_firewall()?;
+        async fn apply_recorded_routes(
+            &mut self,
+            routes: &[PlannedRoute],
+            stage: TransitionStage,
+        ) -> OperationResult {
+            self.runtime
+                .prepare_routes(routes)
+                .await
+                .map_err(Failure::at(FailureStage::Routes))?;
+            self.journal.stage = stage;
+            // Keep the union until verification succeeds: failed writes can leave
+            // either old or new routes behind, including a partially applied plan.
+            for route in routes {
+                let prefix = route.prefix.to_string();
+                if !self.journal.routes.iter().any(|old| old.prefix == prefix) {
+                    self.journal
+                        .routes
+                        .push(crate::journal::JournalRoute { prefix });
+                }
+            }
+            self.save_journal()?;
+            self.runtime
+                .apply_routes(routes)
+                .await
+                .map_err(Failure::at(FailureStage::Routes))
+        }
+
+        fn apply_journaled_firewall(&mut self, firewall: &FirewallPlan) -> OperationResult {
+            self.runtime
+                .prepare_firewall()
+                .map_err(Failure::at(FailureStage::FirewallApply))?;
             self.journal.stage = TransitionStage::Firewall;
             self.journal.pf_anchor_installed |= firewall.is_active();
             self.journal.pf_was_enabled = self.runtime.pf_original_state();
-            self.journal_store.save(&self.journal)?;
+            self.save_journal()?;
+            // Adapter success includes independent rule verification and eviction
+            // of incompatible PF states. No other operation establishes Verified.
             self.runtime.apply_firewall(firewall)?;
-            self.journal.pf_anchor_installed = firewall.is_active();
-            self.journal_store.save(&self.journal)
+            self.event(StateEvent::ProtectionVerified {
+                required: firewall.is_active(),
+            });
+            // Retain the recovery flag until the clean journal is committed.
+            // A failed final write may require reasserting the previous guard.
+            self.journal.pf_anchor_installed |= firewall.is_active();
+            self.save_journal()
         }
 
-        async fn rollback(
+        async fn failed_request(
             &mut self,
-            plan: &AggregatePlan,
-            firewall: &FirewallPlan,
-            active: &[ActiveProfile],
-        ) -> Result<()> {
-            let mut errors = Vec::new();
-            if let Err(error) = self.runtime.apply_dns(plan) {
-                errors.push(error.to_string());
+            failure: Failure,
+            old_active: &[ActiveProfile],
+            candidate: Option<&str>,
+            guard: &FirewallPlan,
+        ) -> AppError {
+            if matches!(failure.stage, FailureStage::Journal | FailureStage::Cleanup) {
+                return self.failed(failure);
             }
-            if firewall.is_active()
-                && let Err(error) = self.runtime.apply_firewall(firewall)
-            {
-                errors.push(error.to_string());
+            tracing::warn!(stage = ?failure.stage, "requested transition failed; verifying rollback");
+            if failure.stage.is_protection() {
+                self.event(StateEvent::Failed(failure.stage));
             }
-            if let Err(error) = self.runtime.apply_routes(&plan.routes).await {
-                errors.push(error.to_string());
-            }
-            if errors.is_empty()
-                && !firewall.is_active()
-                && let Err(error) = self.runtime.apply_firewall(firewall)
-            {
-                errors.push(error.to_string());
-            }
-            if errors.is_empty() {
-                if active.is_empty() {
-                    self.journal = RecoveryJournal::clean();
-                } else {
-                    self.journal.dirty = true;
-                    self.journal.stage = TransitionStage::Dns;
-                    self.journal.record_routes(&plan.routes);
-                    self.journal.pf_anchor_installed = firewall.is_active();
-                    self.journal.pf_was_enabled = self.runtime.pf_original_state();
-                }
-                self.journal_store.save(&self.journal)
+            let old_plan = aggregate(old_active);
+            let old_firewall = generate_firewall(old_active, &old_plan);
+            let rollback_guard = if old_firewall.is_active() {
+                &old_firewall
             } else {
-                self.stale_recovery = true;
-                Err(AppError::Runtime(errors.join("; ")))
+                guard
+            };
+            let rollback = async {
+                // Stop immediately on a failed protection check. DNS and routes
+                // may only be restored behind verified required protection.
+                self.apply_transition(&old_plan.routes, &old_plan, rollback_guard)
+                    .await?;
+                if let Some(name) = candidate {
+                    self.stop_profiles(&[name.to_owned()]).await?;
+                }
+                self.finish_transition(old_active, rollback_guard)
+            }
+            .await;
+            match rollback {
+                Ok(()) => {
+                    let _ = self.publish_status();
+                    failure.error
+                }
+                Err(rollback) => {
+                    tracing::warn!(stage = ?rollback.stage, "rollback failed");
+                    if rollback.stage.is_protection() {
+                        self.event(StateEvent::Failed(rollback.stage));
+                    }
+                    self.failed(Failure::new(
+                        if rollback.stage == FailureStage::Journal {
+                            FailureStage::Journal
+                        } else {
+                            FailureStage::Rollback
+                        },
+                        AppError::Runtime(format!(
+                            "{}; rollback also failed: {}",
+                            failure.error, rollback.error
+                        )),
+                    ))
+                }
+            }
+        }
+
+        fn finish_transition(
+            &mut self,
+            active: &[ActiveProfile],
+            guard: &FirewallPlan,
+        ) -> OperationResult {
+            let plan = aggregate(active);
+            if active.is_empty() {
+                // Routes, DNS and tunnel cleanup have all passed verification.
+                let empty = generate_firewall(active, &plan);
+                let cleanup = self
+                    .apply_journaled_firewall(&empty)
+                    .and_then(|()| self.commit_journal(RecoveryJournal::clean()));
+                if let Err(failure) = cleanup {
+                    self.restore_cleanup_guard(guard);
+                    return Err(failure);
+                }
+            } else {
+                let mut committed = self.journal.clone();
+                committed.record_routes(&plan.routes);
+                committed.stage = TransitionStage::Dns;
+                self.commit_journal(committed)?;
+            }
+            self.cleanup_guard = None;
+            self.event(StateEvent::Complete {
+                has_profiles: !active.is_empty(),
+            });
+            Ok(())
+        }
+
+        fn restore_cleanup_guard(&mut self, guard: &FirewallPlan) {
+            if !guard.is_active() {
+                return;
+            }
+            self.cleanup_guard = Some(guard.clone());
+            self.journal.pf_anchor_installed = true;
+            match self.runtime.apply_firewall(guard) {
+                Ok(()) => {
+                    self.event(StateEvent::ProtectionVerified { required: true });
+                }
+                Err(restore) => {
+                    self.event(StateEvent::Failed(restore.stage));
+                }
             }
         }
 
@@ -638,70 +826,78 @@ mod macos {
             &mut self,
             current: &AggregatePlan,
             will_use_dns: bool,
-        ) -> Result<()> {
+        ) -> OperationResult {
             if self.journal.dns_snapshot.is_none() && will_use_dns {
-                self.journal.dns_snapshot = Some(self.runtime.dns_snapshot()?);
+                self.journal.dns_snapshot = Some(
+                    self.runtime
+                        .dns_snapshot()
+                        .map_err(Failure::at(FailureStage::Dns))?,
+                );
             }
-            self.journal.version = crate::journal::JOURNAL_VERSION;
             self.journal.dirty = true;
             self.journal.stage = TransitionStage::Prepared;
-            self.journal.record_routes(&current.routes);
-            self.journal_store.save(&self.journal)
+            for route in &current.routes {
+                let prefix = route.prefix.to_string();
+                if !self.journal.routes.iter().any(|old| old.prefix == prefix) {
+                    self.journal
+                        .routes
+                        .push(crate::journal::JournalRoute { prefix });
+                }
+            }
+            self.save_journal()
         }
 
-        async fn recover_if_needed(&mut self) -> Result<()> {
-            if !self.stale_recovery {
-                return Ok(());
-            }
-            self.runtime.recover_stale(&self.journal).await?;
-            self.journal = RecoveryJournal::clean();
-            self.journal_store.save(&self.journal)?;
-            self.stale_recovery = false;
-            self.publish_status()
+        fn save_journal(&mut self) -> OperationResult {
+            self.runtime
+                .save_journal(&self.journal_store, &self.journal)
+                .map_err(Failure::at(FailureStage::Journal))
+        }
+
+        fn commit_journal(&mut self, journal: RecoveryJournal) -> OperationResult {
+            self.runtime
+                .save_journal(&self.journal_store, &journal)
+                .map_err(Failure::at(FailureStage::Journal))?;
+            self.journal = journal;
+            Ok(())
         }
 
         async fn refresh_routes(&mut self) {
-            if self.tunnels.is_empty() || self.stale_recovery {
-                self.route_refresh.clear();
+            if self.event(StateEvent::RetryDue) != Effect::RestoreProtection {
                 return;
-            }
-            // A network change can temporarily invalidate routes. Keep the
-            // supervisor, tunnels and firewall alive while retrying, with the
-            // control loop free to serve requests between attempts.
-            let result = self.recompute_after_default_route_change().await;
-            self.route_refresh.complete(result, Instant::now());
-            if let Err(error) = self.publish_status() {
-                tracing::error!(%error, "cannot publish route refresh status");
-            }
-        }
-
-        async fn recompute_after_default_route_change(&mut self) -> Result<()> {
-            if self.tunnels.is_empty() {
-                return Ok(());
             }
             let active = self.active_profiles();
             let plan = aggregate(&active);
-            // Keep protection installed across the entire refresh and backoff.
-            // Reassert it and evict bypassing states before changing any route.
-            // A firewall failure stops this attempt before route mutation.
-            self.apply_journaled_firewall(&generate_firewall(&active, &plan))?;
-            self.runtime.apply_routes(&plan.routes).await?;
-            self.journal.record_routes(&plan.routes);
-            self.journal.stage = TransitionStage::Dns;
-            self.journal_store.save(&self.journal)
+            let firewall = generate_firewall(&active, &plan);
+            let result = async {
+                self.apply_journaled_firewall(&firewall)?;
+                self.apply_recorded_routes(&plan.routes, TransitionStage::AggregateRoutes)
+                    .await?;
+                self.runtime
+                    .apply_dns(&plan)
+                    .map_err(Failure::at(FailureStage::Dns))?;
+                self.finish_transition(&active, &firewall)
+            }
+            .await;
+            if let Err(failure) = result {
+                self.failed(failure);
+            }
+            if let Err(error) = self.publish_status() {
+                tracing::error!(%error, "cannot publish recovery status");
+            }
+        }
+
+        fn has_resources(&self) -> bool {
+            !self.tunnels.is_empty() || !self.pending_cleanup.is_empty()
         }
 
         fn active_profiles(&self) -> Vec<ActiveProfile> {
-            self.tunnels.values().map(Tunnel::active_profile).collect()
+            self.tunnels.values().map(R::active_profile).collect()
         }
 
         fn status(&self, name: Option<&str>) -> Result<StatusReport> {
             let active = self.active_profiles();
-            let plan = aggregate(&active);
-            let mut report = StatusReport::build(&active, &plan, self.stale_recovery);
-            if self.route_refresh.is_reconnecting() {
-                report.mark_reconnecting();
-            }
+            let mut report = StatusReport::build(&active, &aggregate(&active), false);
+            report.set_network_status(self.machine.status());
             let report = report.select(name);
             if let Some(name) = name
                 && report.profiles.is_empty()
@@ -715,6 +911,9 @@ mod macos {
             write_atomic(self.status_path, &self.status(None)?)
         }
     }
+
+    #[cfg(test)]
+    mod tests;
 
     fn endpoint_stage(old: &AggregatePlan, new: &AggregatePlan) -> Vec<PlannedRoute> {
         let mut routes: HashMap<_, _> = old

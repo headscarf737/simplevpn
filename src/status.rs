@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AppError, Result,
     planner::{ActiveProfile, AggregatePlan},
+    supervisor::state::{FailureStage, NetworkState, NetworkStatus, Protection},
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -18,6 +19,8 @@ pub struct StatusReport {
     pub dns_owner: Option<String>,
     pub shadowed_dns: Vec<String>,
     pub recovery_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_status: Option<NetworkStatus>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,9 +67,7 @@ fn is_false(value: &bool) -> bool {
 impl StatusReport {
     pub fn mark_reconnecting(&mut self) {
         for profile in &mut self.profiles {
-            if profile.state == ProfileState::Connected {
-                profile.state = ProfileState::Reconnecting;
-            }
+            profile.state = ProfileState::Reconnecting;
             // Do not claim planned routes are installed after failed verification.
             for route in &mut profile.routes {
                 route.installed = false;
@@ -78,7 +79,22 @@ impl StatusReport {
     // Unprivileged status clients cannot inspect the root-only journal, so a
     // cached connected/standby profile must itself imply pending recovery.
     pub fn supervisor_unavailable(&mut self, journal_dirty: bool) {
-        self.recovery_pending |= journal_dirty || !self.profiles.is_empty();
+        self.recovery_pending |= journal_dirty
+            || !self.profiles.is_empty()
+            || self
+                .network_status
+                .as_ref()
+                .is_some_and(|network| network.state != NetworkState::Idle);
+        // Cached verification is never an assurance about the current firewall.
+        self.network_status = self.network_status.as_ref().map(|_| NetworkStatus {
+            state: if self.recovery_pending {
+                NetworkState::RecoveryRequired
+            } else {
+                NetworkState::Idle
+            },
+            protection: Protection::Unverified,
+            reason: Some(FailureStage::SupervisorUnavailable),
+        });
         for profile in &mut self.profiles {
             profile.state = ProfileState::RecoveryPending;
             for route in &mut profile.routes {
@@ -147,11 +163,58 @@ impl StatusReport {
                 .cmp(&left.priority)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        Self {
+        let mut report = Self {
             profiles,
             dns_owner,
             shadowed_dns: plan.shadowed_dns.clone(),
             recovery_pending,
+            network_status: None,
+        };
+        if recovery_pending {
+            report.invalidate_profiles(ProfileState::RecoveryPending);
+        }
+        report
+    }
+
+    fn invalidate_profiles(&mut self, state: ProfileState) {
+        for profile in &mut self.profiles {
+            profile.state = state;
+            for route in &mut profile.routes {
+                route.installed = false;
+            }
+        }
+    }
+
+    pub fn set_network_status(&mut self, network: NetworkStatus) {
+        self.recovery_pending = matches!(
+            network.state,
+            NetworkState::Blocked | NetworkState::RecoveryRequired
+        );
+        if self.recovery_pending {
+            self.invalidate_profiles(ProfileState::RecoveryPending);
+        } else if network.state != NetworkState::Ready
+            || network.protection == Protection::Unverified
+        {
+            self.mark_reconnecting();
+        }
+        self.network_status = Some(network);
+    }
+
+    pub fn summary(&self) -> Option<&'static str> {
+        match self.network_status.as_ref().map(|network| network.state) {
+            Some(NetworkState::Blocked) => Some("Protection could not be verified — retrying…"),
+            Some(NetworkState::RecoveryRequired) => Some("Recovery required — use Disconnect All"),
+            Some(NetworkState::Recovering) => Some("Reconnecting VPN…"),
+            Some(NetworkState::Applying | NetworkState::Disconnecting) => Some("Updating VPN…"),
+            _ if self.recovery_pending => Some("Recovery required — use Disconnect All"),
+            _ if self
+                .profiles
+                .iter()
+                .any(|profile| profile.state == ProfileState::Reconnecting) =>
+            {
+                Some("Reconnecting VPN…")
+            }
+            _ => None,
         }
     }
 
@@ -171,6 +234,7 @@ impl StatusReport {
             dns_owner: self.dns_owner.clone(),
             shadowed_dns: self.shadowed_dns.clone(),
             recovery_pending: self.recovery_pending,
+            network_status: self.network_status.clone(),
         }
     }
 }
@@ -219,6 +283,61 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::*;
+
+    #[test]
+    fn new_status_is_optional_and_round_trips_with_conservative_projections() {
+        let old = r#"{"profiles":[],"dns_owner":null,"shadowed_dns":[],"recovery_pending":false}"#;
+        let mut report: StatusReport = serde_json::from_str(old).unwrap();
+        assert!(report.network_status.is_none());
+        assert_eq!(report.summary(), None);
+        for (state, protection, pending, summary) in [
+            (
+                NetworkState::Recovering,
+                Protection::Verified,
+                false,
+                "Reconnecting VPN…",
+            ),
+            (
+                NetworkState::Blocked,
+                Protection::Unverified,
+                true,
+                "Protection could not be verified — retrying…",
+            ),
+            (
+                NetworkState::RecoveryRequired,
+                Protection::Unverified,
+                true,
+                "Recovery required — use Disconnect All",
+            ),
+        ] {
+            report.set_network_status(NetworkStatus {
+                state,
+                protection,
+                reason: Some(FailureStage::Routes),
+            });
+            assert_eq!(report.recovery_pending, pending);
+            assert_eq!(report.summary(), Some(summary));
+            let json = serde_json::to_string(&report).unwrap();
+            assert_eq!(serde_json::from_str::<StatusReport>(&json).unwrap(), report);
+            assert_eq!(report.select(None).network_status, report.network_status);
+        }
+    }
+
+    #[test]
+    fn supervisor_disappearance_invalidates_even_an_empty_cached_verification() {
+        let mut report = StatusReport::default();
+        report.set_network_status(NetworkStatus {
+            state: NetworkState::Ready,
+            protection: Protection::Verified,
+            reason: None,
+        });
+        report.supervisor_unavailable(false);
+        assert!(report.recovery_pending);
+        let network = report.network_status.unwrap();
+        assert_eq!(network.state, NetworkState::RecoveryRequired);
+        assert_eq!(network.protection, Protection::Unverified);
+        assert_eq!(network.reason, Some(FailureStage::SupervisorUnavailable));
+    }
 
     #[test]
     fn offline_status_never_claims_cached_tunnels_are_connected() {

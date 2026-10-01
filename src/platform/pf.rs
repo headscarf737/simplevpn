@@ -13,6 +13,11 @@ use crate::{
     firewall::{FirewallPlan, FirewallRule, NdpKind, StateView, Transport, should_delete_state},
 };
 
+use crate::supervisor::{
+    operations::{Failure, OperationResult},
+    state::FailureStage,
+};
+
 const FILTER_ANCHOR: &str = "simplevpn";
 const SCRUB_ANCHOR: &str = "simplevpn-scrub";
 const MAX_CLEANUP_PASSES: usize = 64;
@@ -36,18 +41,24 @@ impl PfController {
         })
     }
 
-    pub fn apply(&mut self, policy: &FirewallPlan) -> Result<()> {
+    pub fn apply(&mut self, policy: &FirewallPlan) -> OperationResult {
         if !policy.is_active() {
-            if !self.active {
-                self.was_enabled = None;
-                return Ok(());
-            }
-            return self.reset();
+            return self.reset().map_err(Failure::at(FailureStage::Cleanup));
         }
-        // Only retain endpoint states admitted while our root-only exception
-        // was already in force. A pre-VPN state can bypass a new UID rule.
-        // Any failed apply forgets this trust so the next attempt rechecks it.
+        // Failed application discards trust in existing endpoint states.
         let previous_endpoints = std::mem::take(&mut self.restricted_endpoints);
+        let expected_filter_rules = self
+            .install(policy)
+            .map_err(Failure::at(FailureStage::FirewallApply))?;
+        self.verify_active(expected_filter_rules)
+            .map_err(Failure::at(FailureStage::FirewallVerify))?;
+        self.cleanup_states(policy, &previous_endpoints)
+            .map_err(Failure::at(FailureStage::StateCleanup))?;
+        self.restricted_endpoints = policy.restricted_endpoints();
+        Ok(())
+    }
+
+    fn install(&mut self, policy: &FirewallPlan) -> Result<usize> {
         self.prepare()?;
         self.pf.try_enable().map_err(pf_error)?;
         // From this point onward rollback must remove our state even if a later write fails.
@@ -77,10 +88,7 @@ impl PfController {
         transaction.add_change(FILTER_ANCHOR, filter_change);
         transaction.add_change(SCRUB_ANCHOR, scrub_change);
         transaction.commit().map_err(pf_error)?;
-        self.verify_active(expected_filter_rules)?;
-        self.cleanup_states(policy, &previous_endpoints)?;
-        self.restricted_endpoints = policy.restricted_endpoints();
-        Ok(())
+        Ok(expected_filter_rules)
     }
 
     pub fn prepare(&mut self) -> Result<()> {

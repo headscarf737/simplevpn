@@ -30,6 +30,7 @@ pub struct MacRuntime {
     route_changes: tokio::sync::mpsc::UnboundedReceiver<()>,
     applied_routes: Vec<PlannedRoute>,
     dns_baseline: Option<DnsSnapshot>,
+    pending_interfaces: Vec<String>,
 }
 
 impl MacRuntime {
@@ -58,7 +59,15 @@ impl MacRuntime {
             route_changes,
             applied_routes: Vec::new(),
             dns_baseline: None,
+            pending_interfaces: Vec::new(),
         })
+    }
+
+    pub async fn start_tunnel(
+        &mut self,
+        profile: crate::config::Profile,
+    ) -> crate::supervisor::operations::OperationResult<Tunnel> {
+        Tunnel::start(profile, &mut self.pending_interfaces).await
     }
 
     pub async fn route_changed(&mut self) -> Option<()> {
@@ -72,6 +81,13 @@ impl MacRuntime {
     pub async fn apply_routes(&mut self, routes: &[PlannedRoute]) -> Result<()> {
         verify::reject_route_conflicts(&self.routes, routes, &self.applied_routes).await?;
         let previous = self.applied_routes.clone();
+        // Ownership is separate from verification. A partial write may install
+        // some new prefixes before read-back fails; retain them for safe retry.
+        for route in routes {
+            if !self.applied_routes.contains(route) {
+                self.applied_routes.push(route.clone());
+            }
+        }
         self.routes.clear_routes().map_err(|error| {
             AppError::Runtime(format!(
                 "cannot clear the previous Talpid route plan: {error}"
@@ -132,7 +148,10 @@ impl MacRuntime {
         verify::reject_route_conflicts(&self.routes, routes, &self.applied_routes).await
     }
 
-    pub fn apply_firewall(&mut self, policy: &FirewallPlan) -> Result<()> {
+    pub fn apply_firewall(
+        &mut self,
+        policy: &FirewallPlan,
+    ) -> crate::supervisor::operations::OperationResult {
         self.firewall.apply(policy)
     }
 
@@ -174,16 +193,15 @@ impl MacRuntime {
     }
 
     pub async fn recover_stale(&mut self, journal: &RecoveryJournal) -> Result<()> {
+        // Explicit recovery can also follow an incomplete live transition. Stop
+        // Talpid's DNS monitoring before restoring the persistent baseline.
+        self.reset_dns()?;
         if let Some(snapshot) = &journal.dns_snapshot {
             dns_snapshot::restore(snapshot)?;
             dns_snapshot::verify_restored(snapshot)?;
         }
         // Always inspect and remove project-owned PF artifacts. Older or
         // interrupted journals may not have persisted the anchor flag yet.
-        let previous_pf_state = journal
-            .pf_anchor_installed
-            .then_some(journal.pf_was_enabled)
-            .flatten();
         for route in &journal.routes {
             remove_stale_route(&self.routes, &route.prefix).await?;
         }
@@ -202,8 +220,11 @@ impl MacRuntime {
             default_v6.as_ref().map(|route| route.interface_index),
         )
         .await?;
-        // Keep crash protection until restoration has been verified.
-        self.firewall.force_remove_anchor(previous_pf_state)?;
+        for interface in &self.pending_interfaces {
+            verify::verify_interface_removed(interface).await?;
+        }
+        self.pending_interfaces.clear();
+        // The supervisor keeps protection until tunnel cleanup also succeeds.
         self.applied_routes.clear();
         Ok(())
     }
@@ -213,7 +234,21 @@ impl MacRuntime {
         self.firewall.original_enabled_state()
     }
 
-    pub async fn stop(mut self) -> Result<()> {
+    pub fn cleanup_recovered_firewall(&mut self, journal: &RecoveryJournal) -> Result<()> {
+        let previous = journal
+            .pf_anchor_installed
+            .then_some(journal.pf_was_enabled)
+            .flatten();
+        self.firewall.force_remove_anchor(previous)
+    }
+
+    pub async fn stop(mut self, cleanup_verified: bool) -> Result<()> {
+        if !cleanup_verified {
+            // Dirty startup, failed rollback and failed teardown must retain PF.
+            // No Drop implementation on the controller releases its anchors.
+            self.routes.stop().await;
+            return Ok(());
+        }
         let mut errors = Vec::new();
         let previous_routes = self.applied_routes.clone();
         if let Err(error) = self.reset_dns() {

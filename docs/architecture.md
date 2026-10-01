@@ -108,16 +108,58 @@ endpoint interface need not match the preferred default interface. Tunnel routes
 must still use their exact assigned tunnel. Talpid retains ownership of route
 selection and updates.
 
-Physical default-route notifications are coalesced for 250 milliseconds. Failed
-refreshes keep the supervisor, tunnels, and firewall alive and retry with backoff
-from one second up to 30 seconds. A new network notification advances a pending
-retry. Status and disconnect requests remain available between attempts. Profiles
-show `reconnecting`, without claiming their routes are installed, until route
-verification succeeds. Successful VPN changes cancel outstanding retries;
-pending crash recovery remains an explicit recovery operation.
-Each refresh reapplies the protected policy atomically and evicts incompatible
-states before touching routes. Failure to apply or verify the firewall aborts
-that attempt; neither the error path nor the retry timer removes protection.
+The supervisor owns an explicit state machine; tunnel resources and per-profile
+route/DNS ownership remain separate. Runtime states do not replace recovery
+journal stages, and the persistent journal remains version 1.
+
+| Runtime state | Meaning |
+| --- | --- |
+| `idle` | No active profiles; cleanup completed |
+| `applying` | Applying a requested profile configuration |
+| `ready` | Aggregate routes, DNS and required firewall policy passed verification |
+| `recovering` | Network restoration is scheduled or in progress |
+| `blocked` | Firewall protection could not be verified; retry protection first |
+| `disconnecting` | Removing profiles and restoring the remaining configuration |
+| `recovery_required` | Dirty startup, persistence failure, or incomplete rollback/cleanup; explicit recovery required |
+
+Physical default-route notifications immediately invalidate installed-route and
+connected-profile claims, then coalesce restoration for 250 milliseconds. Failed
+network restoration retries with exponential backoff from one second to 30
+seconds. A new notification may advance an attempt but never postpone an earlier
+deadline. Retry deadlines, attempt counts and reasons belong to the runtime state.
+Commands are processed between attempts; individual disconnect remains available
+during ordinary recovery. Disconnect All cancels scheduled retries when processed,
+including when its cleanup fails.
+
+Every automatic attempt first reapplies and verifies the required firewall and
+removes incompatible PF states. Only then does it restore routes and reconcile
+DNS. A protection failure enters `blocked`, without route or DNS mutation in that
+attempt. Route and DNS failures enter `recovering`; journal failures and incomplete
+rollback or cleanup enter `recovery_required`. Classification uses typed operation
+stages, never error strings. A failed requested transition may return to a stable
+state only after verified rollback. Partial route ownership, unfinished tunnel
+cleanup and the cleanup guard remain tracked independently of status claims.
+Shutdown cannot release PF protection after an unresolved transition.
+
+In `blocked` and `recovery_required`, profile changes are rejected and Disconnect
+All remains available. CLI `up` retains explicit crash recovery when there are no
+live or pending tunnel resources; otherwise use `down --all` first. Authorization
+and app-session lifetime rules are unchanged.
+
+Status JSON optionally includes `network_status`, with `state`, `protection`, and
+an optional stable `reason` code. Protection is `not_required`, `verified`, or
+`unverified`. `verified` describes the last successful firewall check, not a
+continuous guarantee. `ready` describes verified system configuration; it does
+not assert a WireGuard handshake or add tunnel health detection/restarts.
+`blocked` and `recovery_required` project to the existing `recovery_pending`
+boolean and per-profile state for older clients. Other incomplete configurations
+project to `reconnecting`, with no routes reported installed. New clients still
+decode older responses lacking `network_status`. If the supervisor disappears,
+cached protection assurances are discarded and crash-recovery reporting applies.
+
+The CLI and menu distinguish “Reconnecting VPN…”, “Protection could not be
+verified — retrying…”, and “Recovery required — use Disconnect All”. Transition
+logs include states, operation stages and retry timing without profile secrets.
 
 This follows the separation used by Mullvad: routing determines the path, while
 PF enforces which traffic may leave it. The upstream comparison used commit

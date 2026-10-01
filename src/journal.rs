@@ -260,28 +260,4 @@ mod tests {
             "unchanged"
         );
     }
-
-    #[test]
-    fn every_transition_stage_rolls_back_in_reverse_order_when_faulted() {
-        let stages = [
-            TransitionStage::Interface,
-            TransitionStage::EndpointRoutes,
-            TransitionStage::AggregateRoutes,
-            TransitionStage::Firewall,
-            TransitionStage::Dns,
-        ];
-        for failed in stages {
-            let mut applied = Vec::new();
-            for stage in stages {
-                if stage == failed {
-                    break;
-                }
-                applied.push(stage);
-            }
-            let rollback: Vec<_> = applied.iter().rev().copied().collect();
-            let mut expected = applied;
-            expected.reverse();
-            assert_eq!(rollback, expected, "fault at {failed:?}");
-        }
-    }
 }

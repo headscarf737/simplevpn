@@ -4,10 +4,42 @@ import Foundation
 public struct VPNStatus: Decodable, Sendable, Equatable {
   public let profiles: [ActiveProfile]
   public let recoveryPending: Bool
+  public let networkStatus: NetworkStatus?
+
+  public init(profiles: [ActiveProfile], recoveryPending: Bool, networkStatus: NetworkStatus? = nil)
+  {
+    self.profiles = profiles
+    self.recoveryPending = recoveryPending
+    self.networkStatus = networkStatus
+  }
+
+  public var requiresRecovery: Bool {
+    recoveryPending || networkStatus?.state == .blocked || networkStatus?.state == .recoveryRequired
+  }
+
+  public var profileChangesAllowed: Bool {
+    !requiresRecovery && networkStatus?.state != .applying && networkStatus?.state != .disconnecting
+  }
 
   enum CodingKeys: String, CodingKey {
     case profiles
     case recoveryPending = "recovery_pending"
+    case networkStatus = "network_status"
+  }
+}
+
+public struct NetworkStatus: Decodable, Sendable, Equatable {
+  public let state: State
+  public let protection: Protection
+  public let reason: String?
+
+  public enum State: String, Decodable, Sendable {
+    case idle, applying, ready, recovering, blocked, disconnecting
+    case recoveryRequired = "recovery_required"
+  }
+  public enum Protection: String, Decodable, Sendable {
+    case verified, unverified
+    case notRequired = "not_required"
   }
 }
 
@@ -79,7 +111,17 @@ public enum ProfileDiscovery {
 
   public static func rows(files: [String: URL], status: VPNStatus?) -> [ProfileRow] {
     var active: [String: ActiveProfile.State] = [:]
-    for profile in status?.profiles ?? [] { active[profile.name] = profile.state }
+    for profile in status?.profiles ?? [] {
+      if status?.requiresRecovery == true {
+        active[profile.name] = .recoveryPending
+      } else if let network = status?.networkStatus,
+        network.state != .ready || network.protection == .unverified
+      {
+        active[profile.name] = .reconnecting
+      } else {
+        active[profile.name] = profile.state
+      }
+    }
     return Set(files.keys).union(active.keys).sorted().map {
       ProfileRow(name: $0, file: files[$0], state: active[$0])
     }

@@ -56,6 +56,27 @@ SIMPLEVPN_RUN_SOCKET_TESTS=1 swift test --package-path macos \
 
 See [the menu bar guide](macos-app.md) for building the app bundle.
 
+## Supervisor failure-injection tests
+
+The normal Rust suite exercises the production supervisor through an injectable
+network-operation adapter and a controlled clock. It covers firewall application,
+read-back verification and state eviction, routes, DNS, journal writes, rollback,
+tunnel cleanup and final firewall removal. Tests assert operation ordering,
+retained protection, command handling between attempts, partial profile removal,
+retry cancellation, dirty startup and status compatibility. Swift tests cover the
+new summaries, action availability, legacy responses and discarded cached status
+when the supervisor disappears. These tests do not mutate host networking.
+
+For a separate app bundle without launching it:
+
+```console
+SIMPLEVPN_APP_DIR="$PWD/target/macos/SimpleVPN-Supervisor-Test.app" \
+  scripts/build-macos-app.sh
+```
+
+Keep automated results separate from the disposable-host packet observations
+below. Passing a state-machine test is not evidence of live leak protection.
+
 ## Root integration tests
 
 Root integration tests are ignored by default and must be run explicitly on a

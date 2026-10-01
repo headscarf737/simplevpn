@@ -345,13 +345,13 @@ async fn show_status(name: Option<&str>, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&report)
                 .map_err(|error| AppError::Runtime(format!("cannot encode status: {error}")))?
         );
-    } else if report.profiles.is_empty() {
-        if report.recovery_pending {
-            println!("no active profiles; crash recovery is pending");
-        } else {
+    } else {
+        if let Some(summary) = report.summary() {
+            println!("{summary}");
+        }
+        if report.profiles.is_empty() && report.summary().is_none() {
             println!("no active profiles");
         }
-    } else {
         for profile in &report.profiles {
             println!(
                 "{}: {:?}, priority {}, interface {}, DNS {:?}",
@@ -362,6 +362,8 @@ async fn show_status(name: Option<&str>, json: bool) -> Result<()> {
                     println!("  {} (blocked: no matching interface address)", route.cidr);
                 } else if let Some(owner) = &route.shadowed_by {
                     println!("  {} (shadowed by {owner})", route.cidr);
+                } else if !route.installed {
+                    println!("  {} (not verified)", route.cidr);
                 } else {
                     println!("  {}", route.cidr);
                 }

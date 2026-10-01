@@ -689,3 +689,64 @@ func sessionSocketConnectsToLocalListenerWithCloseOnExec() async throws {
   #expect(connection.isOpen)
   #expect(fcntl(connection.descriptor, F_GETFD) & FD_CLOEXEC != 0)
 }
+
+@Test @MainActor func networkStatusControlsSummariesActionsAndStaleClaims() async throws {
+  for (state, protection, summary, canToggle) in [
+    ("recovering", "verified", "Reconnecting VPN…", true),
+    ("blocked", "unverified", "Protection could not be verified — retrying…", false),
+    ("recovery_required", "unverified", "Recovery required — use Disconnect All", false),
+    ("applying", "verified", "Updating VPN…", false),
+    ("disconnecting", "verified", "Updating VPN…", false),
+  ] {
+    // Even inconsistent legacy fields cannot override the supervisor state.
+    let data = Data(
+      """
+      {"profiles":[{"name":"work","state":"connected"}],"recovery_pending":false,
+       "network_status":{"state":"\(state)","protection":"\(protection)","reason":"network_changed"}}
+      """.utf8)
+    let decoded = try JSONDecoder().decode(VPNStatus.self, from: data)
+    let client = StubClient([.success(decoded), .success(status())])
+    let model = MenuController(client: client, discover: { [:] })
+    await model.refresh()
+    #expect(model.summary == summary)
+    #expect(model.canToggle == canToggle)
+    #expect(model.canDisconnectAll)
+    #expect(model.rows.first?.state != .connected)
+    if !canToggle {
+      await model.toggle("work")
+      #expect(await client.actions.isEmpty)
+    }
+    await model.disconnectAll()
+    #expect(await client.actions == [.disconnectAll])
+  }
+}
+
+@Test @MainActor func unavailableSupervisorDiscardsProtectionAssurances() async throws {
+  let data = Data(
+    #"{"profiles":[{"name":"work","state":"connected"}],"recovery_pending":false,"network_status":{"state":"ready","protection":"verified"}}"#
+      .utf8)
+  let decoded = try JSONDecoder().decode(VPNStatus.self, from: data)
+  let client = StubClient([.success(decoded), .failure(.command("unavailable"))])
+  let model = MenuController(client: client, discover: { [:] })
+  await model.refresh()
+  #expect(model.status?.networkStatus?.protection == .verified)
+  await model.refresh()
+  #expect(model.status == nil)
+  #expect(model.rows.isEmpty)
+  #expect(model.summary == "VPN status unavailable")
+  #expect(!model.canToggle && !model.canDisconnectAll)
+}
+
+@Test func olderStatusRemainsCompatibleAndBlockedWithoutProfilesAllowsCleanup() throws {
+  let old = try JSONDecoder().decode(
+    VPNStatus.self, from: Data(#"{"profiles":[],"recovery_pending":false}"#.utf8))
+  #expect(old.networkStatus == nil)
+  #expect(old.profileChangesAllowed)
+  let blocked = try JSONDecoder().decode(
+    VPNStatus.self,
+    from: Data(
+      #"{"profiles":[],"recovery_pending":false,"network_status":{"state":"blocked","protection":"unverified"}}"#
+        .utf8))
+  #expect(blocked.requiresRecovery)
+  #expect(!blocked.profileChangesAllowed)
+}

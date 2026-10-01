@@ -99,14 +99,39 @@ impl FirewallPlan {
 
 #[must_use]
 pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPlan {
-    let full_lockdown = [false, true].into_iter().any(|ipv6| {
-        crate::network::covers_family(
-            active
-                .iter()
-                .flat_map(|profile| profile.allowed_routes.iter().copied()),
-            ipv6,
-        )
-    });
+    generate_policy(active, routes, None)
+}
+
+/// Protect the requested destinations before its interface exists. Only already
+/// active tunnels receive pass rules; the pending tunnel gets endpoint exceptions
+/// and destination blocks. Full coverage locks down both address families.
+#[must_use]
+pub fn generate_connecting(
+    active: &[ActiveProfile],
+    routes: &AggregatePlan,
+    pending: &crate::config::Profile,
+    endpoints: &[SocketAddr],
+) -> FirewallPlan {
+    generate_policy(active, routes, Some((pending, endpoints)))
+}
+
+fn generate_policy(
+    active: &[ActiveProfile],
+    routes: &AggregatePlan,
+    pending: Option<(&crate::config::Profile, &[SocketAddr])>,
+) -> FirewallPlan {
+    let mut protected_destinations: Vec<_> = active
+        .iter()
+        .flat_map(|profile| profile.allowed_routes.iter().copied())
+        .collect();
+    if let Some((profile, _)) = pending {
+        protected_destinations.extend(profile.allowed_routes());
+    }
+    protected_destinations.sort_by_key(ToString::to_string);
+    protected_destinations.dedup();
+    let full_lockdown = [false, true]
+        .into_iter()
+        .any(|ipv6| crate::network::covers_family(protected_destinations.iter().copied(), ipv6));
     let mut tunnel_routes: Vec<_> = routes
         .routes
         .iter()
@@ -115,12 +140,6 @@ pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPla
     // A narrower destination must be checked before a broader tunnel's pass.
     tunnel_routes.sort_by_key(|route| Reverse(route.prefix.prefix()));
     let routed_destinations: HashSet<_> = tunnel_routes.iter().map(|route| route.prefix).collect();
-    let mut protected_destinations: Vec<_> = active
-        .iter()
-        .flat_map(|profile| profile.allowed_routes.iter().copied())
-        .collect();
-    protected_destinations.sort_by_key(ToString::to_string);
-    protected_destinations.dedup();
     let mut plan = FirewallPlan {
         full_lockdown,
         protected_destinations,
@@ -144,7 +163,14 @@ pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPla
             // A split profile can select DNS outside its allowed networks. If
             // any active profile requires full lockdown, never let that DNS
             // exception bypass the tunnel (including the other IP family).
-            if full_lockdown && interface.is_none() {
+            if interface.is_none()
+                && (full_lockdown
+                    || pending.is_some_and(|(profile, _)| {
+                        profile
+                            .allowed_routes()
+                            .any(|network| network.contains(*server))
+                    }))
+            {
                 continue;
             }
             plan.rules.push(FirewallRule::AllowDns {
@@ -158,6 +184,13 @@ pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPla
                 transport: Transport::Udp,
             });
         }
+    } else if let Some((profile, _)) = pending
+        && profile.dns.is_some()
+    {
+        // No pending resolver may bypass protection before its tunnel exists.
+        plan.dns_owner = Some(profile.name.clone());
+    }
+    if plan.dns_owner.is_some() {
         plan.rules.push(FirewallRule::BlockClassicDns {
             transport: Transport::Tcp,
         });
@@ -173,6 +206,9 @@ pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPla
             .iter()
             .flat_map(|profile| profile.endpoints.iter().copied())
             .collect();
+        if let Some((_, endpoints)) = pending {
+            plan.endpoint_exceptions.extend_from_slice(endpoints);
+        }
         plan.endpoint_exceptions.sort_unstable();
         plan.endpoint_exceptions.dedup();
         for endpoint in &plan.endpoint_exceptions {
@@ -301,6 +337,109 @@ mod tests {
             ],
             dns_servers: vec!["10.0.0.53".parse().unwrap_or_else(|e| panic!("{e}"))],
             dns_search_domains: Vec::new(),
+        }
+    }
+
+    fn pending_profile(routes: &[&str]) -> crate::config::Profile {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "name": "pending", "priority": 200,
+            "interface": { "private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", "addresses": ["10.1.0.2/32"] },
+            "dns": { "servers": ["10.1.0.53"] },
+            "peers": [{ "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=", "endpoint": "192.0.2.1:51820", "allowed_ips": routes }]
+        })).unwrap()
+    }
+
+    #[test]
+    fn connecting_full_policy_blocks_both_families_without_tunnel_passes() {
+        for routes in [
+            &["0.0.0.0/0"][..],
+            &["::/0"][..],
+            &["0.0.0.0/1", "128.0.0.0/1"][..],
+        ] {
+            let endpoint = "192.0.2.1:51820".parse().unwrap();
+            let policy = generate_connecting(
+                &[],
+                &AggregatePlan::default(),
+                &pending_profile(routes),
+                &[endpoint],
+            );
+            assert!(policy.full_lockdown);
+            assert_eq!(policy.endpoint_exceptions, [endpoint]);
+            assert!(policy.rules.contains(&FirewallRule::BlockAllOutbound));
+            assert!(policy.rules.contains(&FirewallRule::BlockClassicDns {
+                transport: Transport::Udp
+            }));
+            assert!(policy.rules.iter().all(|rule| !matches!(
+                rule,
+                FirewallRule::AllowTunnel { .. }
+                    | FirewallRule::AllowTunnelNetwork { .. }
+                    | FirewallRule::AllowDns { .. }
+            )));
+            // Existing application/DNS/endpoint states are evicted before startup.
+            for remote in ["192.0.2.1:51820", "198.51.100.1:443", "[2001:db8::1]:53"] {
+                assert!(should_delete_state(
+                    &policy,
+                    StateView {
+                        local: "192.0.2.2:12345".parse().unwrap(),
+                        remote: remote.parse().unwrap(),
+                        transport: Transport::Udp,
+                    },
+                    &[]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn connecting_split_policy_covers_pending_destinations_without_widening_passes() {
+        let mut active = full_profile();
+        active.allowed_routes = vec!["10.0.0.0/24".parse().unwrap()];
+        let active = [active];
+        let policy = generate_connecting(
+            &active,
+            &aggregate(&active),
+            &pending_profile(&["10.1.0.0/24", "2001:db8::/64"]),
+            &[],
+        );
+        assert!(!policy.full_lockdown);
+        for network in ["10.0.0.0/24", "10.1.0.0/24", "2001:db8::/64"] {
+            assert!(
+                policy
+                    .protected_destinations
+                    .contains(&network.parse().unwrap())
+            );
+            assert!(policy.rules.contains(&FirewallRule::BlockNetwork {
+                network: network.parse().unwrap()
+            }));
+        }
+        assert!(policy.rules.contains(&FirewallRule::AllowTunnelNetwork {
+            interface: "utun8".into(),
+            network: "10.0.0.0/24".parse().unwrap(),
+        }));
+        assert!(!policy.rules.contains(&FirewallRule::BlockAllOutbound));
+    }
+
+    #[test]
+    fn connecting_union_can_require_full_lockdown_and_restrict_existing_external_dns() {
+        let mut active = full_profile();
+        active.allowed_routes = vec!["0.0.0.0/1".parse().unwrap()];
+        active.dns_servers = vec!["198.51.100.53".parse().unwrap()];
+        let active = [active];
+        for pending_routes in [&["128.0.0.0/1"][..], &["198.51.100.0/24"][..]] {
+            let policy = generate_connecting(
+                &active,
+                &aggregate(&active),
+                &pending_profile(pending_routes),
+                &[],
+            );
+            assert!(policy.rules.iter().all(|rule| !matches!(
+                rule,
+                FirewallRule::AllowDns {
+                    interface: None,
+                    ..
+                }
+            )));
+            assert_eq!(policy.full_lockdown, pending_routes == ["128.0.0.0/1"]);
         }
     }
 

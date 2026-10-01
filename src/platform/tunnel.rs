@@ -13,7 +13,7 @@ use crate::{AppError, Result, config::Profile, planner::ActiveProfile};
 
 use super::verify;
 use crate::supervisor::{
-    operations::{Failure, OperationResult},
+    operations::{Failure, OperationResult, TunnelParameters},
     state::FailureStage,
 };
 
@@ -25,11 +25,7 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub async fn start(
-        profile: Profile,
-        pending_interfaces: &mut Vec<String>,
-    ) -> OperationResult<Self> {
-        tracing::info!(profile = %profile.name, "starting tunnel");
+    pub async fn resolve(profile: Profile) -> OperationResult<TunnelParameters> {
         let mut endpoints = Vec::with_capacity(profile.peers.len());
         for peer in &profile.peers {
             endpoints.push(
@@ -38,6 +34,16 @@ impl Tunnel {
                     .map_err(Failure::at(FailureStage::Interface))?,
             );
         }
+
+        Ok(TunnelParameters { profile, endpoints })
+    }
+
+    pub async fn start(
+        parameters: TunnelParameters,
+        pending_interfaces: &mut Vec<String>,
+    ) -> OperationResult<Self> {
+        let TunnelParameters { profile, endpoints } = parameters;
+        tracing::info!(profile = %profile.name, "starting tunnel");
 
         let tun = TunDevice::from_name("utun")
             .map_err(|error| AppError::Platform(format!("cannot create GotaTun utun: {error}")))

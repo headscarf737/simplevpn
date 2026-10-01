@@ -8,6 +8,7 @@ use crate::{
     journal::{DnsSnapshot, JournalStore, RecoveryJournal},
     planner::{ActiveProfile, AggregatePlan, PlannedRoute},
 };
+use std::net::SocketAddr;
 
 #[derive(Debug)]
 pub struct Failure {
@@ -16,6 +17,13 @@ pub struct Failure {
 }
 
 pub type OperationResult<T = ()> = std::result::Result<T, Failure>;
+
+// Endpoint resolution creates no tunnel resources. The same resolved addresses
+// are used by the connecting firewall and the device, avoiding a second lookup.
+pub struct TunnelParameters {
+    pub profile: Profile,
+    pub endpoints: Vec<SocketAddr>,
+}
 
 impl Failure {
     pub fn new(stage: FailureStage, error: AppError) -> Self {
@@ -29,12 +37,16 @@ impl Failure {
 // The production adapter includes independent read-back verification in each
 // operation. Tests replace it, including persistence and tunnel cleanup, so they
 // exercise the actual supervisor orchestration without privileged mutations.
+// This boundary covers explicit supervisor commands, not Talpid's autonomous
+// route refreshes or cleanup. PF constrains traffic during those updates.
 pub trait NetworkOperations {
     type Tunnel;
     fn now(&self) -> tokio::time::Instant {
         tokio::time::Instant::now()
     }
-    async fn start_tunnel(&mut self, profile: Profile) -> OperationResult<Self::Tunnel>;
+    async fn resolve_tunnel(&mut self, profile: Profile) -> OperationResult<TunnelParameters>;
+    async fn start_tunnel(&mut self, parameters: TunnelParameters)
+    -> OperationResult<Self::Tunnel>;
     fn active_profile(tunnel: &Self::Tunnel) -> ActiveProfile;
     async fn stop_tunnel(&mut self, tunnel: &mut Self::Tunnel) -> Result<()>;
     fn dns_snapshot(&self) -> Result<DnsSnapshot>;
@@ -52,8 +64,14 @@ pub trait NetworkOperations {
 
 impl NetworkOperations for crate::platform::MacRuntime {
     type Tunnel = crate::platform::Tunnel;
-    async fn start_tunnel(&mut self, profile: Profile) -> OperationResult<Self::Tunnel> {
-        self.start_tunnel(profile).await
+    async fn resolve_tunnel(&mut self, profile: Profile) -> OperationResult<TunnelParameters> {
+        crate::platform::Tunnel::resolve(profile).await
+    }
+    async fn start_tunnel(
+        &mut self,
+        parameters: TunnelParameters,
+    ) -> OperationResult<Self::Tunnel> {
+        self.start_tunnel(parameters).await
     }
     fn active_profile(tunnel: &Self::Tunnel) -> ActiveProfile {
         tunnel.active_profile()

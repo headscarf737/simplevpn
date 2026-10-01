@@ -2,11 +2,13 @@
 
 use super::*;
 use crate::journal::DnsSnapshot;
+use crate::supervisor::operations::TunnelParameters;
 use crate::supervisor::state::{NetworkState, Protection};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Call {
+    Resolve,
     Start,
     Stop,
     PrepareFirewall,
@@ -33,6 +35,8 @@ struct FakeNetwork {
     dns_owner: Option<String>,
     persisted: Option<RecoveryJournal>,
     firewall: FirewallPlan,
+    startup_policies: Vec<FirewallPlan>,
+    start_failure_stage: FailureStage,
 }
 
 impl FakeNetwork {
@@ -47,6 +51,8 @@ impl FakeNetwork {
             dns_owner: None,
             persisted: None,
             firewall: FirewallPlan::default(),
+            startup_policies: vec![],
+            start_failure_stage: FailureStage::Interface,
         }
     }
     fn fail(&mut self, call: Call) {
@@ -74,9 +80,27 @@ impl NetworkOperations for FakeNetwork {
     fn now(&self) -> Instant {
         self.now
     }
-    async fn start_tunnel(&mut self, profile: Profile) -> OperationResult<Self::Tunnel> {
-        self.trip(Call::Start)
+    async fn resolve_tunnel(&mut self, profile: Profile) -> OperationResult<TunnelParameters> {
+        self.trip(Call::Resolve)
             .map_err(Failure::at(FailureStage::Interface))?;
+        Ok(TunnelParameters {
+            profile,
+            endpoints: vec!["192.0.2.1:51820".parse().unwrap()],
+        })
+    }
+    async fn start_tunnel(
+        &mut self,
+        parameters: TunnelParameters,
+    ) -> OperationResult<Self::Tunnel> {
+        assert!(
+            self.protected && self.verified,
+            "tunnel started before protection verification"
+        );
+        assert!(self.persisted.as_ref().unwrap().pf_anchor_installed);
+        self.startup_policies.push(self.firewall.clone());
+        self.trip(Call::Start)
+            .map_err(Failure::at(self.start_failure_stage))?;
+        let TunnelParameters { profile, endpoints } = parameters;
         Ok(ActiveProfile {
             name: profile.name.clone(),
             priority: profile.priority,
@@ -84,7 +108,7 @@ impl NetworkOperations for FakeNetwork {
             interface: format!("utun{}", profile.priority + 10),
             interface_addresses: profile.interface.addresses.clone(),
             allowed_routes: profile.allowed_routes().collect(),
-            endpoints: vec!["192.0.2.1:51820".parse().unwrap()],
+            endpoints,
             dns_servers: profile
                 .dns
                 .as_ref()
@@ -135,10 +159,11 @@ impl NetworkOperations for FakeNetwork {
         self.trip(Call::PrepareRoutes)
     }
     async fn apply_routes(&mut self, routes: &[PlannedRoute]) -> Result<()> {
-        // All tests involving profiles must reach this operation behind a guard.
+        // Explicit supervisor route commands must follow the protection check.
+        // This fake does not model Talpid's independent route maintenance.
         assert!(
             !self.protected || self.verified,
-            "route mutation behind unverified protection"
+            "supervisor route command behind unverified protection"
         );
         self.trip(Call::Routes)?;
         self.routes = routes.to_vec();
@@ -195,7 +220,111 @@ async fn retry(supervisor: &mut Supervisor<'_, FakeNetwork>) {
 }
 
 #[tokio::test]
-async fn firewall_faults_block_route_mutation_and_retry_only_after_verification() {
+async fn connecting_guard_is_verified_and_journaled_before_interface_creation() {
+    for existing in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.json");
+        let mut supervisor = supervisor(&path, false);
+        if existing {
+            let mut split = profile("split", 1);
+            split.peers[0].allowed_ips = vec!["10.0.1.0/24".parse().unwrap()];
+            supervisor.up(split).await.unwrap();
+        }
+        supervisor.runtime.calls.clear();
+        supervisor.up(profile("full", 2)).await.unwrap();
+        let calls = &supervisor.runtime.calls;
+        let index = |call| calls.iter().position(|actual| *actual == call).unwrap();
+        assert!(index(Call::Resolve) < index(Call::FirewallApply));
+        assert!(index(Call::StateCleanup) < index(Call::Start));
+        assert!(index(Call::Start) < index(Call::Routes));
+        let guard = supervisor.runtime.startup_policies.last().unwrap();
+        assert!(guard.full_lockdown);
+        assert!(
+            guard
+                .rules
+                .contains(&crate::firewall::FirewallRule::BlockAllOutbound)
+        );
+        assert!(guard.rules.iter().all(|rule| match rule {
+            crate::firewall::FirewallRule::AllowTunnel { interface }
+            | crate::firewall::FirewallRule::AllowTunnelNetwork { interface, .. } =>
+                interface != "utun12",
+            _ => true,
+        }));
+    }
+}
+
+#[tokio::test]
+async fn connecting_firewall_failures_never_start_a_tunnel() {
+    for call in [
+        Call::PrepareFirewall,
+        Call::FirewallApply,
+        Call::FirewallVerify,
+        Call::StateCleanup,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.json");
+        let mut supervisor = supervisor(&path, false);
+        supervisor.runtime.fail(call);
+        supervisor.runtime.fail(call); // Also prevent rollback from verifying protection.
+        assert!(supervisor.up(profile("full", 1)).await.is_err());
+        assert!(!supervisor.runtime.calls.contains(&Call::Start));
+        assert!(!supervisor.runtime.calls.contains(&Call::Routes));
+        assert!(!supervisor.runtime.calls.contains(&Call::Dns));
+        assert!(!supervisor.runtime.calls.contains(&Call::RemoveFirewall));
+        assert!(supervisor.machine.recovery_required());
+    }
+}
+
+#[tokio::test]
+async fn connecting_journal_failures_never_start_unrecorded_resources() {
+    // Prepared journal, pre-firewall intent, post-verification persistence.
+    for write in 1..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.json");
+        let mut supervisor = supervisor(&path, false);
+        supervisor.runtime.faults.push_back((Call::Journal, write));
+        assert!(supervisor.up(profile("full", 1)).await.is_err());
+        assert!(!supervisor.runtime.calls.contains(&Call::Start));
+        assert!(!supervisor.runtime.calls.contains(&Call::Routes));
+        assert!(supervisor.machine.recovery_required());
+        if write == 3 {
+            assert!(supervisor.runtime.protected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_start_or_rollback_cleanup_retains_connecting_lockdown() {
+    for incomplete_start in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.json");
+        let mut supervisor = supervisor(&path, false);
+        let mut split = profile("split", 1);
+        split.peers[0].allowed_ips = vec!["10.0.1.0/24".parse().unwrap()];
+        supervisor.up(split).await.unwrap();
+        if incomplete_start {
+            supervisor.runtime.start_failure_stage = FailureStage::Cleanup;
+            supervisor.runtime.fail(Call::Start);
+        } else {
+            supervisor.runtime.fail(Call::Dns);
+            supervisor.runtime.fail(Call::Stop);
+        }
+        assert!(supervisor.up(profile("full", 2)).await.is_err());
+        assert!(supervisor.machine.recovery_required());
+        assert!(supervisor.runtime.firewall.full_lockdown);
+        assert!(supervisor.cleanup_guard.as_ref().unwrap().full_lockdown);
+        // A later failure removing PF must reassert the stronger connecting guard.
+        supervisor.runtime.fail(Call::RemoveFirewall);
+        assert!(supervisor.down_all().await.is_err());
+        assert!(supervisor.runtime.protected);
+        assert!(supervisor.runtime.firewall.full_lockdown);
+        supervisor.down_all().await.unwrap();
+        assert_eq!(supervisor.machine.status().state, NetworkState::Idle);
+    }
+}
+
+#[tokio::test]
+async fn firewall_faults_block_supervisor_route_commands_until_verification() {
     for (call, stage) in [
         (Call::PrepareFirewall, FailureStage::FirewallApply),
         (Call::FirewallApply, FailureStage::FirewallApply),

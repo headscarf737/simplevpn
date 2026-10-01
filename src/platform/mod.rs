@@ -35,6 +35,8 @@ pub struct MacRuntime {
 
 impl MacRuntime {
     pub async fn new() -> Result<Self> {
+        // Talpid retains its automatic refresh and cleanup behavior. PF constrains
+        // traffic during those updates; supervisor checks gate its own commands.
         let routes = RouteManagerHandle::spawn()
             .await
             .map_err(|error| AppError::Platform(format!("cannot start Talpid routing: {error}")))?;
@@ -65,9 +67,9 @@ impl MacRuntime {
 
     pub async fn start_tunnel(
         &mut self,
-        profile: crate::config::Profile,
+        parameters: crate::supervisor::operations::TunnelParameters,
     ) -> crate::supervisor::operations::OperationResult<Tunnel> {
-        Tunnel::start(profile, &mut self.pending_interfaces).await
+        Tunnel::start(parameters, &mut self.pending_interfaces).await
     }
 
     pub async fn route_changed(&mut self) -> Option<()> {
@@ -246,6 +248,7 @@ impl MacRuntime {
         if !cleanup_verified {
             // Dirty startup, failed rollback and failed teardown must retain PF.
             // No Drop implementation on the controller releases its anchors.
+            // Talpid still performs its normal route cleanup when stopped.
             self.routes.stop().await;
             return Ok(());
         }

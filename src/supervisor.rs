@@ -471,11 +471,33 @@ mod macos {
                     .map_err(Failure::at(FailureStage::Cleanup))
                     .map_err(|failure| self.failed(failure))?;
             }
-            let mut tunnel = match self.runtime.start_tunnel(profile).await {
-                Ok(tunnel) => tunnel,
+            let parameters = match self.runtime.resolve_tunnel(profile).await {
+                Ok(parameters) => parameters,
                 Err(failure) => {
                     return Err(self
                         .failed_request(failure, &old_active, None, &old_firewall)
+                        .await);
+                }
+            };
+            let connecting = crate::firewall::generate_connecting(
+                &old_active,
+                &old_plan,
+                &parameters.profile,
+                &parameters.endpoints,
+            );
+            // Retain this policy for explicit cleanup even if interface creation
+            // partially fails and no Tunnel can be returned to the supervisor.
+            self.cleanup_guard = Some(connecting.clone());
+            if let Err(failure) = self.apply_journaled_firewall(&connecting) {
+                return Err(self
+                    .failed_request(failure, &old_active, None, &connecting)
+                    .await);
+            }
+            let mut tunnel = match self.runtime.start_tunnel(parameters).await {
+                Ok(tunnel) => tunnel,
+                Err(failure) => {
+                    return Err(self
+                        .failed_request(failure, &old_active, None, &connecting)
                         .await);
                 }
             };
@@ -495,7 +517,7 @@ mod macos {
                         Failure::new(FailureStage::Interface, error),
                         &old_active,
                         None,
-                        &old_firewall,
+                        &connecting,
                     )
                     .await);
             }
@@ -736,18 +758,21 @@ mod macos {
             }
             let old_plan = aggregate(old_active);
             let old_firewall = generate_firewall(old_active, &old_plan);
-            let rollback_guard = if old_firewall.is_active() {
-                &old_firewall
-            } else {
+            let rollback_guard = if guard.is_active() {
                 guard
+            } else {
+                &old_firewall
             };
             let rollback = async {
-                // Stop immediately on a failed protection check. DNS and routes
-                // may only be restored behind verified required protection.
+                // Stop our rollback commands on a failed protection check.
+                // Talpid's independent route maintenance remains enabled.
                 self.apply_transition(&old_plan.routes, &old_plan, rollback_guard)
                     .await?;
                 if let Some(name) = candidate {
                     self.stop_profiles(&[name.to_owned()]).await?;
+                }
+                if !old_active.is_empty() {
+                    self.apply_journaled_firewall(&old_firewall)?;
                 }
                 self.finish_transition(old_active, rollback_guard)
             }

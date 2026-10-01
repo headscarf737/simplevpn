@@ -1237,8 +1237,12 @@ fn short_declared_message_lengths_are_rejected() {
 
 #[test]
 fn truncated_sockaddr_padding_is_rejected() {
-    let mut iterator = RouteSockAddrIterator::new(&[0, 0], AddressFlag::RTA_NETMASK);
-    assert!(iterator.next().unwrap().is_err());
+    for bytes in [&[0, 0][..], &[5, 0xff, 0, 0, 0xff, 0][..]] {
+        // The second case has a complete five-byte address, but its next
+        // four-byte-aligned offset lies beyond the six-byte buffer.
+        let mut iterator = RouteSockAddrIterator::new(bytes, AddressFlag::RTA_NETMASK);
+        assert!(iterator.next().unwrap().is_err());
+    }
 }
 
 #[test]

@@ -6,9 +6,12 @@
 
 The checked-in toolchain file pins Rust 1.97.1. The first build requires network
 access for registry and Git dependencies. `talpid-dns` is fetched from Mullvad
-commit `16c2f486e79d0579225b65b55e57fb1f9c8df7a2`; `talpid-routing` is vendored
+commit `c5f20b94b04ebf972f34517ae0cf08e9e82e95cf`; `talpid-routing` is vendored
 from the same revision and patched locally. See
 [upstream provenance](../vendor/talpid-routing/UPSTREAM.md).
+The remaining routing patches were checked against this revision and are still
+needed for exact route verification, recovery and parser robustness; the review
+and regression evidence are recorded in that provenance document.
 
 ```console
 cargo fmt --check
@@ -66,6 +69,12 @@ retained protection, command handling between attempts, partial profile removal,
 retry cancellation, dirty startup and status compatibility. Swift tests cover the
 new summaries, action availability, legacy responses and discarded cached status
 when the supervisor disappears. These tests do not mutate host networking.
+
+Startup tests assert that the connecting policy and journal precede interface
+creation, including full coverage assembled from split prefixes, IPv6, DNS and
+split-to-full rollback failures. These ordering assertions cover explicit
+supervisor commands. Talpid retains upstream automatic route maintenance, which
+is outside the fake network adapter's scope.
 
 For a separate app bundle without launching it:
 
@@ -143,12 +152,21 @@ For split-only profiles, apply the tunnel-only expectation to their configured
 destinations; unrelated traffic and explicitly selected external DNS may use
 the normal network. Also test enabling a full tunnel after split-only use so
 pre-existing endpoint and DNS states cannot bypass the stronger policy.
+Capture initial connection as well: after endpoint resolution and connecting
+policy verification, protected probes must remain blocked until the tunnel is
+usable. Include interface/device startup failures and a failed split-to-full
+rollback cleanup; the full guard must remain in place through cleanup. During a
+firewall verification failure, confirm that the supervisor issues no route or DNS
+commands in that recovery attempt. Talpid and macOS may still change routes;
+use the external captures to check that PF continues to constrain protected
+traffic during those changes. A verification failure alone establishes neither
+successful blocking nor a leak.
 After reconnect succeeds, verify that probes resume through the intended VPN.
 After an explicit Disconnect All, verify normal connectivity and clean recovery
 state.
 
 PF enforcement is also subject to macOS bugs. Mullvad documents
-[cases where macOS ignores firewall rules after an OS update](https://github.com/mullvad/mullvadvpn-app/blob/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b/docs/known-issues.md#possible-leaks-on-macos-on-first-start-after-upgrade).
+[cases where macOS ignores firewall rules after an OS update](https://github.com/mullvad/mullvadvpn-app/blob/c5f20b94b04ebf972f34517ae0cf08e9e82e95cf/docs/known-issues.md#possible-leaks-on-macos-on-first-start-after-upgrade).
 Record the macOS version and whether the machine has rebooted since an update
 when reporting results.
 

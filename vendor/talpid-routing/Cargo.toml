@@ -12,7 +12,7 @@ publish = false
 futures = "0.3.34"
 ipnetwork = "0.21.1"
 log = "0.4"
-talpid-types = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "16c2f486e79d0579225b65b55e57fb1f9c8df7a2" }
+talpid-error = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "c5f20b94b04ebf972f34517ae0cf08e9e82e95cf" }
 thiserror = "2.0"
 tokio = { version = "1.53", features = [
   "io-util",

@@ -73,9 +73,12 @@ restores the captured DNS snapshot, routes, and the prior PF enabled state. Each
 privileged write is read back from macOS before the transition is reported as
 successful; exact user-managed routes that predate `simplevpn` are rejected
 rather than silently replaced. Kernel-cloned endpoint cache routes are safely
-reused. A hard crash deliberately leaves the `simplevpn` PF anchors fail-closed;
-the next `up` or `down --all` restores the sanitized journal snapshot before
-continuing. Cleanup verifies that both project anchors contain no rules or
+reused. Recovery also accepts kernel-cloned routes recreated on a physical
+interface after removal, including when Wi-Fi and Ethernet share a gateway.
+Exact non-default static routes and clones on tunnel interfaces still fail
+cleanup verification. A hard crash deliberately leaves the `simplevpn` PF
+anchors fail-closed; the next `up` or `down --all` restores the sanitized journal
+snapshot before continuing. Cleanup verifies that both project anchors contain no rules or
 states and that the root PF rulesets contain no references to them. macOS may
 retain an inert, empty anchor name in `pfctl -s Anchors`; that namespace entry
 does not affect packet filtering.

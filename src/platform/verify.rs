@@ -266,6 +266,7 @@ pub async fn verify_routes_removed(
     physical_v4: Option<u16>,
     physical_v6: Option<u16>,
 ) -> Result<()> {
+    let physical_interfaces = physical_interface_indices();
     for route in routes {
         let prefix: IpNetwork = route
             .prefix
@@ -274,16 +275,12 @@ pub async fn verify_routes_removed(
         let Some(actual) = inspect_route(manager, prefix).await? else {
             continue;
         };
-        if prefix.prefix() == 0 {
-            let expected = if prefix.is_ipv4() {
-                physical_v4
-            } else {
-                physical_v6
-            };
-            if expected.is_some_and(|interface| actual.interface_index == interface) {
-                continue;
-            }
-        } else if actual.prefix != prefix {
+        let physical_default = if prefix.is_ipv4() {
+            physical_v4
+        } else {
+            physical_v6
+        };
+        if route_was_removed(&actual, prefix, physical_default, &physical_interfaces) {
             continue;
         }
         return Err(verification_error(format!(
@@ -292,6 +289,28 @@ pub async fn verify_routes_removed(
         )));
     }
     Ok(())
+}
+
+fn route_was_removed(
+    actual: &RouteInfo,
+    removed_prefix: IpNetwork,
+    physical_default: Option<u16>,
+    physical_interfaces: &HashSet<u16>,
+) -> bool {
+    if removed_prefix.prefix() == 0 {
+        return actual.interface_index != 0 && physical_default == Some(actual.interface_index);
+    }
+    if actual.prefix != removed_prefix {
+        return true;
+    }
+    // Restoring physical routes can recreate an endpoint's kernel cache entry
+    // before recovery reads it back. It is not a leftover SimpleVPN route, even
+    // when macOS chooses Wi-Fi while Ethernet is the preferred default. Keep
+    // rejecting exact static routes and clones that still point into a tunnel.
+    actual.was_cloned
+        && actual.interface_index != 0
+        && (physical_default == Some(actual.interface_index)
+            || physical_interfaces.contains(&actual.interface_index))
 }
 
 async fn inspect_route(
@@ -432,6 +451,78 @@ fn verification_error(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use crate::planner::RoutePurpose;
+
+    #[test]
+    fn recovery_accepts_recreated_endpoint_clones_on_either_physical_link() {
+        let physical = HashSet::from([14, 18]);
+        for prefix in ["192.0.2.1/32", "2001:db8::1/128"] {
+            let prefix = prefix.parse().unwrap();
+            for interface_index in [14, 18] {
+                let actual = RouteInfo {
+                    prefix,
+                    interface_index,
+                    was_cloned: true,
+                };
+                assert!(route_was_removed(&actual, prefix, Some(18), &physical));
+                assert!(route_was_removed(&actual, prefix, None, &physical));
+                // The route manager may support a physical uplink absent from
+                // System Configuration's interface inventory.
+                assert!(route_was_removed(
+                    &actual,
+                    prefix,
+                    Some(interface_index),
+                    &HashSet::new()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_static_routes_and_clones_on_tunnel_or_unknown_interfaces() {
+        let physical = HashSet::from([14, 18]);
+        for prefix in ["192.0.2.1/32", "2001:db8::1/128"] {
+            let prefix = prefix.parse().unwrap();
+            for interface_index in [0, 14, 18, 22, 999] {
+                let actual = RouteInfo {
+                    prefix,
+                    interface_index,
+                    was_cloned: false,
+                };
+                assert!(!route_was_removed(&actual, prefix, Some(18), &physical));
+                if !physical.contains(&interface_index) {
+                    let cloned = RouteInfo {
+                        was_cloned: true,
+                        ..actual
+                    };
+                    assert!(!route_was_removed(&cloned, prefix, Some(18), &physical));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_accepts_covering_routes_and_requires_restored_physical_defaults() {
+        let physical = HashSet::from([14, 18]);
+        for (host, default) in [("192.0.2.1/32", "0.0.0.0/0"), ("2001:db8::1/128", "::/0")] {
+            let host = host.parse().unwrap();
+            let default = default.parse().unwrap();
+            let actual = RouteInfo {
+                prefix: default,
+                interface_index: 18,
+                was_cloned: false,
+            };
+            assert!(route_was_removed(&actual, host, Some(18), &physical));
+            assert!(route_was_removed(&actual, default, Some(18), &physical));
+            for interface_index in [0, 14, 22] {
+                let other = RouteInfo {
+                    interface_index,
+                    ..actual
+                };
+                assert!(!route_was_removed(&other, default, Some(18), &physical));
+            }
+            assert!(!route_was_removed(&actual, default, None, &physical));
+        }
+    }
 
     #[test]
     fn endpoint_route_can_use_wifi_while_ethernet_is_preferred() {

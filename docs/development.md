@@ -90,6 +90,47 @@ It checks both connection orders, disconnect transitions, route and DNS
 ownership, IPv6 blocking, and final restoration. Independently check actual
 internet egress and Site-server forwarding with reachable test destinations.
 
+## Reconnect leak validation
+
+The unit tests cover route verification, retries, DNS exception generation, and
+PF state eviction, including a switch from split to full tunneling. The root
+tests also inspect installed rules for root-only endpoint exceptions and
+stateless tunnel/DNS passes. These checks do not prove that the kernel blocks
+packets during a real sleep/wake or Ethernet/Wi-Fi transition.
+
+Validate that behavior on a disposable Mac with both links connected, using
+controlled IPv4 and IPv6 probe receivers and packet capture outside the Mac on
+both physical paths. Send continuous, identifiable TCP and UDP probes, DNS over
+UDP and TCP, and HTTPS/QUIC traffic. Confirm that the receivers and captures see
+the probes in a control run; a timeout alone is not evidence of blocking.
+
+Repeat while sleeping/waking, unplugging/replugging the dock, losing both links,
+and restoring Wi-Fi before Ethernet. Include a sustained route-refresh failure
+long enough to reach the 30-second retry interval. Keep existing connections
+open and start new ones throughout the transition.
+
+| Traffic | Expected during full-tunnel reconnect |
+| --- | --- |
+| Application IPv4/IPv6, including sockets bound to either physical interface | Tunnel only, or blocked; no plaintext probe on either physical path |
+| Selected DNS server | Allowed only on its assigned tunnel |
+| Other DNS servers, including the other IP family | Blocked |
+| VPN endpoint IP/UDP port | Root-owned VPN transport is allowed |
+| Unprivileged UDP to the VPN endpoint, including a pre-existing PF state | Blocked |
+| DHCP and the explicitly allowed NDP messages | Allowed for link recovery |
+
+For split-only profiles, apply the tunnel-only expectation to their configured
+destinations; unrelated traffic and explicitly selected external DNS may use
+the normal network. Also test enabling a full tunnel after split-only use so
+pre-existing endpoint and DNS states cannot bypass the stronger policy.
+After reconnect succeeds, verify that probes resume through the intended VPN.
+After an explicit Disconnect All, verify normal connectivity and clean recovery
+state.
+
+PF enforcement is also subject to macOS bugs. Mullvad documents
+[cases where macOS ignores firewall rules after an OS update](https://github.com/mullvad/mullvadvpn-app/blob/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b/docs/known-issues.md#possible-leaks-on-macos-on-first-start-after-upgrade).
+Record the macOS version and whether the machine has rebooted since an update
+when reporting results.
+
 ## Contributions
 
 Keep changes focused and include a reproducible description of the problem or

@@ -39,6 +39,9 @@ public final class MenuController {
     if statusError != nil { return "VPN status unavailable" }
     guard let status else { return "Loading VPN status…" }
     if status.recoveryPending { return "Recovery required — use Disconnect All" }
+    if status.profiles.contains(where: { $0.state == .reconnecting }) {
+      return "Reconnecting VPN…"
+    }
     switch status.profiles.count {
     case 0: return "No active profiles"
     case 1: return "1 active profile"

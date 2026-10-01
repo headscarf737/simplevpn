@@ -34,6 +34,7 @@ pub struct ProfileStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProfileState {
     Connected,
+    Reconnecting,
     Standby,
     RecoveryPending,
 }
@@ -61,6 +62,18 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl StatusReport {
+    pub fn mark_reconnecting(&mut self) {
+        for profile in &mut self.profiles {
+            if profile.state == ProfileState::Connected {
+                profile.state = ProfileState::Reconnecting;
+            }
+            // Do not claim planned routes are installed after failed verification.
+            for route in &mut profile.routes {
+                route.installed = false;
+            }
+        }
+    }
+
     // A persisted report is historical once its supervisor is unreachable.
     // Unprivileged status clients cannot inspect the root-only journal, so a
     // cached connected/standby profile must itself imply pending recovery.
@@ -209,7 +222,11 @@ mod tests {
 
     #[test]
     fn offline_status_never_claims_cached_tunnels_are_connected() {
-        for state in [ProfileState::Connected, ProfileState::Standby] {
+        for state in [
+            ProfileState::Connected,
+            ProfileState::Reconnecting,
+            ProfileState::Standby,
+        ] {
             let mut report = StatusReport {
                 profiles: vec![ProfileStatus {
                     name: "work".into(),
@@ -239,6 +256,37 @@ mod tests {
         assert!(empty.recovery_pending);
         empty.supervisor_unavailable(false);
         assert!(empty.recovery_pending);
+    }
+
+    #[test]
+    fn failed_route_refresh_reports_reconnecting_without_claiming_installed_routes() {
+        let mut report = StatusReport {
+            profiles: vec![ProfileStatus {
+                name: "work".into(),
+                priority: 0,
+                interface: "utun8".into(),
+                state: ProfileState::Connected,
+                dns: DnsState::Owner,
+                routes: vec![RouteStatus {
+                    cidr: "0.0.0.0/0".into(),
+                    installed: true,
+                    blocked: false,
+                    shadowed_by: None,
+                }],
+            }],
+            ..StatusReport::default()
+        };
+        report.mark_reconnecting();
+        let selected = report.select(Some("work"));
+        assert_eq!(selected.profiles[0].state, ProfileState::Reconnecting);
+        assert!(!selected.profiles[0].routes[0].installed);
+        assert!(!selected.recovery_pending);
+        let json = serde_json::to_string(&selected).unwrap();
+        assert!(json.contains("\"state\":\"reconnecting\""));
+        assert_eq!(
+            serde_json::from_str::<StatusReport>(&json).unwrap(),
+            selected
+        );
     }
 
     #[test]

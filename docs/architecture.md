@@ -86,12 +86,49 @@ have been restored successfully; failed restoration retains the guard and the
 DNS snapshot for retry. Tunnel and DNS passes use `no state`, so every packet is
 checked against the current interface rules. Existing tunnel and DNS states are
 evicted when applying a policy: a matching source address alone cannot establish
-that a PF state is confined to the tunnel. Endpoint transport exceptions remain
-stateful. Split-tunnel destinations also receive interface-bound, stateless pass
+that a PF state is confined to the tunnel. Endpoint transport exceptions require
+root-owned UDP sockets and remain stateful. When an endpoint first becomes
+allowed, existing states to it are evicted: PF state records do not establish
+the originating socket's UID. Subsequent successful policy applications preserve
+transport states for already restricted endpoints. Failed policy applications
+and firewall resets discard that trust.
+Split-tunnel destinations also receive interface-bound, stateless pass
 rules followed by destination blocks, including profiles without DNS. Split-route
 passes are checked from longest to shortest prefix. This prevents traffic falling back to
 the physical network during route replacement or after a tunnel disappears,
 while destinations outside the split routes retain the host's existing policy.
+With any full-tunnel profile active, DNS exceptions require a tunnel route;
+a resolver outside tunnel coverage is blocked even if a split profile selected
+it. This also covers DNS in the opposite IP family from the full-tunnel route.
+
+SimpleVPN verifies that endpoint exception routes have the exact requested prefix
+and use either Talpid's current physical default or an OS-recognized physical
+network interface. Ethernet and Wi-Fi can share a router, so the kernel-selected
+endpoint interface need not match the preferred default interface. Tunnel routes
+must still use their exact assigned tunnel. Talpid retains ownership of route
+selection and updates.
+
+Physical default-route notifications are coalesced for 250 milliseconds. Failed
+refreshes keep the supervisor, tunnels, and firewall alive and retry with backoff
+from one second up to 30 seconds. A new network notification advances a pending
+retry. Status and disconnect requests remain available between attempts. Profiles
+show `reconnecting`, without claiming their routes are installed, until route
+verification succeeds. Successful VPN changes cancel outstanding retries;
+pending crash recovery remains an explicit recovery operation.
+Each refresh reapplies the protected policy atomically and evicts incompatible
+states before touching routes. Failure to apply or verify the firewall aborts
+that attempt; neither the error path nor the retry timer removes protection.
+
+This follows the separation used by Mullvad: routing determines the path, while
+PF enforces which traffic may leave it. The upstream comparison used commit
+[`1d3d03df08dd`](https://github.com/mullvad/mullvadvpn-app/tree/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b).
+Its [route manager](https://github.com/mullvad/mullvadvpn-app/blob/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b/talpid-routing/src/unix/macos/mod.rs)
+uses gateways for endpoint routes and handles refresh errors without exiting.
+Its [macOS offline monitor](https://github.com/mullvad/mullvadvpn-app/blob/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b/talpid-core/src/offline/macos.rs)
+synthesizes a one-second offline interval during network changes, and its
+[PF implementation](https://github.com/mullvad/mullvadvpn-app/blob/1d3d03df08dd0f27fbd98c42acffbffbba4e9e1b/talpid-core/src/firewall/macos.rs)
+restricts relay exceptions to root-owned sockets. SimpleVPN retains its live
+tunnels during route retries instead of rebuilding Mullvad's tunnel state machine.
 
 ## macOS system-command boundary
 

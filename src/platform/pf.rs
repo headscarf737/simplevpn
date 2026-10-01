@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     process::Command,
 };
 
@@ -21,6 +21,7 @@ pub struct PfController {
     pf: pfctl::PfCtl,
     was_enabled: Option<bool>,
     active: bool,
+    restricted_endpoints: Vec<SocketAddr>,
 }
 
 impl PfController {
@@ -31,6 +32,7 @@ impl PfController {
             pf,
             was_enabled: None,
             active: false,
+            restricted_endpoints: Vec::new(),
         })
     }
 
@@ -42,6 +44,10 @@ impl PfController {
             }
             return self.reset();
         }
+        // Only retain endpoint states admitted while our root-only exception
+        // was already in force. A pre-VPN state can bypass a new UID rule.
+        // Any failed apply forgets this trust so the next attempt rechecks it.
+        let previous_endpoints = std::mem::take(&mut self.restricted_endpoints);
         self.prepare()?;
         self.pf.try_enable().map_err(pf_error)?;
         // From this point onward rollback must remove our state even if a later write fails.
@@ -72,7 +78,8 @@ impl PfController {
         transaction.add_change(SCRUB_ANCHOR, scrub_change);
         transaction.commit().map_err(pf_error)?;
         self.verify_active(expected_filter_rules)?;
-        self.cleanup_states(policy)?;
+        self.cleanup_states(policy, &previous_endpoints)?;
+        self.restricted_endpoints = policy.restricted_endpoints();
         Ok(())
     }
 
@@ -84,6 +91,7 @@ impl PfController {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.restricted_endpoints.clear();
         if !self.active && self.was_enabled.is_none() {
             return Ok(());
         }
@@ -163,7 +171,11 @@ impl PfController {
         self.was_enabled
     }
 
-    fn cleanup_states(&mut self, policy: &FirewallPlan) -> Result<()> {
+    fn cleanup_states(
+        &mut self,
+        policy: &FirewallPlan,
+        previous_endpoints: &[SocketAddr],
+    ) -> Result<()> {
         for _ in 0..MAX_CLEANUP_PASSES {
             let mut removed = 0_usize;
             for state in self.pf.get_states().map_err(pf_error)? {
@@ -173,7 +185,7 @@ impl PfController {
                 let Some(view) = state_view(&state)? else {
                     continue;
                 };
-                if should_delete_state(policy, view) {
+                if should_delete_state(policy, view, previous_endpoints) {
                     self.pf.kill_state(&state).map_err(pf_error)?;
                     removed += 1;
                 }
@@ -389,6 +401,9 @@ fn build_rule(rule: &FirewallRule) -> Result<Vec<FilterRule>> {
                 .quick(true)
                 .proto(pfctl::Proto::Udp)
                 .to(*endpoint)
+                // GotaTun's UDP sockets belong to the root supervisor. Match
+                // Mullvad's relay rule: ordinary apps cannot use this bypass.
+                .user(pfctl::Uid::from(0))
                 .keep_state(StatePolicy::Keep)
                 .build()
                 .map_err(pf_error)?,

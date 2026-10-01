@@ -77,6 +77,24 @@ impl FirewallPlan {
     pub fn is_active(&self) -> bool {
         !self.rules.is_empty()
     }
+
+    /// Endpoints whose states can only be created through the root-only pass.
+    /// Outside split-tunnel coverage, unrelated host rules may admit ordinary
+    /// application traffic, so those states cannot be trusted on a later switch
+    /// to a full tunnel.
+    pub fn restricted_endpoints(&self) -> Vec<SocketAddr> {
+        self.endpoint_exceptions
+            .iter()
+            .copied()
+            .filter(|endpoint| {
+                self.full_lockdown
+                    || self
+                        .protected_destinations
+                        .iter()
+                        .any(|network| network.contains(endpoint.ip()))
+            })
+            .collect()
+    }
 }
 
 #[must_use]
@@ -123,6 +141,12 @@ pub fn generate(active: &[ActiveProfile], routes: &AggregatePlan) -> FirewallPla
                     RouteTarget::Tunnel { interface, .. } => Some(interface.clone()),
                     RouteTarget::PhysicalDefault => None,
                 });
+            // A split profile can select DNS outside its allowed networks. If
+            // any active profile requires full lockdown, never let that DNS
+            // exception bypass the tunnel (including the other IP family).
+            if full_lockdown && interface.is_none() {
+                continue;
+            }
             plan.rules.push(FirewallRule::AllowDns {
                 interface: interface.clone(),
                 server: *server,
@@ -221,7 +245,11 @@ pub struct StateView {
 }
 
 #[must_use]
-pub fn should_delete_state(policy: &FirewallPlan, state: StateView) -> bool {
+pub fn should_delete_state(
+    policy: &FirewallPlan,
+    state: StateView,
+    previously_restricted_endpoints: &[SocketAddr],
+) -> bool {
     if policy.dns_owner.is_some()
         && state.remote.port() == 53
         && matches!(state.transport, Transport::Tcp | Transport::Udp)
@@ -235,7 +263,10 @@ pub fn should_delete_state(policy: &FirewallPlan, state: StateView) -> bool {
         return false;
     }
     if state.transport == Transport::Udp && policy.endpoint_exceptions.contains(&state.remote) {
-        return false;
+        // PF does not expose the socket owner's UID in its state table. Old
+        // states to a newly allowed endpoint must be evicted before we can rely
+        // on the root-only pass rule; subsequent refreshes preserve transport.
+        return !previously_restricted_endpoints.contains(&state.remote);
     }
     if policy
         .protected_destinations
@@ -353,13 +384,18 @@ mod tests {
                 remote: "10.20.30.40:443".parse().unwrap(),
                 transport: Transport::Tcp,
             };
-            assert!(should_delete_state(&policy, state));
+            assert!(should_delete_state(
+                &policy,
+                state,
+                &policy.endpoint_exceptions
+            ));
             assert!(!should_delete_state(
                 &policy,
                 StateView {
                     remote: "198.51.100.10:443".parse().unwrap(),
                     ..state
-                }
+                },
+                &policy.endpoint_exceptions
             ));
         }
     }
@@ -434,7 +470,8 @@ mod tests {
                     local: "192.0.2.2:40000".parse().unwrap(),
                     remote: SocketAddr::new(address.parse().unwrap(), 443),
                     transport: Transport::Tcp,
-                }
+                },
+                &policy.endpoint_exceptions
             ));
             if dns {
                 assert!(policy.rules.contains(&FirewallRule::AllowTunnelNetwork {
@@ -514,7 +551,11 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}")),
             transport: Transport::Tcp,
         };
-        assert!(should_delete_state(&policy, ipv6_state));
+        assert!(should_delete_state(
+            &policy,
+            ipv6_state,
+            &policy.endpoint_exceptions
+        ));
     }
 
     #[test]
@@ -530,7 +571,19 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Udp,
         };
-        assert!(!should_delete_state(&policy, endpoint));
+        assert!(!should_delete_state(
+            &policy,
+            endpoint,
+            &policy.endpoint_exceptions
+        ));
+        // A state created before installing the root-only exception has no
+        // trustworthy owner information. Force it through the new UID check.
+        assert!(should_delete_state(&policy, endpoint, &[]));
+        assert!(should_delete_state(
+            &policy,
+            endpoint,
+            &["203.0.113.2:51820".parse().unwrap()],
+        ));
         let tunnel = StateView {
             local: "10.0.0.2:40000".parse().unwrap_or_else(|e| panic!("{e}")),
             remote: "198.51.100.10:443"
@@ -538,7 +591,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Tcp,
         };
-        assert!(should_delete_state(&policy, tunnel));
+        assert!(should_delete_state(
+            &policy,
+            tunnel,
+            &policy.endpoint_exceptions
+        ));
         let physical = StateView {
             local: "192.168.1.10:40000"
                 .parse()
@@ -548,7 +605,92 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Tcp,
         };
-        assert!(should_delete_state(&policy, physical));
+        assert!(should_delete_state(
+            &policy,
+            physical,
+            &policy.endpoint_exceptions
+        ));
+    }
+
+    #[test]
+    fn full_lockdown_never_allows_dns_without_a_tunnel_route() {
+        for (default, dns, address, subnet) in [
+            (
+                "0.0.0.0/0",
+                "2001:db8::53",
+                "2001:db8:1::2/128",
+                "2001:db8:1::/64",
+            ),
+            ("::/0", "192.0.2.53", "192.0.2.2/32", "192.0.2.128/25"),
+        ] {
+            let mut full = full_profile();
+            full.allowed_routes = vec![default.parse().unwrap()];
+            full.interface_addresses
+                .push("fd00::2/128".parse().unwrap());
+            let mut site = full_profile();
+            site.name = "site".into();
+            site.interface = "utun9".into();
+            site.dns_priority = 200;
+            site.interface_addresses = vec![address.parse().unwrap()];
+            site.allowed_routes = vec![subnet.parse().unwrap()];
+            site.dns_servers = vec![dns.parse().unwrap()];
+            let active = vec![full, site];
+            let policy = generate(&active, &aggregate(&active));
+            assert!(policy.full_lockdown);
+            assert_eq!(policy.dns_owner.as_deref(), Some("site"));
+            assert!(!policy.rules.iter().any(|rule| matches!(
+                rule,
+                FirewallRule::AllowDns {
+                    interface: None,
+                    ..
+                }
+            )));
+            for transport in [Transport::Tcp, Transport::Udp] {
+                assert!(
+                    policy
+                        .rules
+                        .contains(&FirewallRule::BlockClassicDns { transport })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_from_split_to_full_evicts_previously_unrestricted_endpoint_states() {
+        for (endpoint, local, split_network) in [
+            ("203.0.113.1:51820", "192.0.2.2:40000", "10.0.0.0/8"),
+            ("[2001:db8::1]:51820", "[2001:db8::2]:40000", "fd00::/8"),
+        ] {
+            let mut profile = full_profile();
+            profile.endpoints = vec![endpoint.parse().unwrap()];
+            profile.allowed_routes = vec![split_network.parse().unwrap()];
+            profile.dns_servers.clear();
+            profile
+                .interface_addresses
+                .push("fd00::2/128".parse().unwrap());
+            let active = vec![profile.clone()];
+            let split = generate(&active, &aggregate(&active));
+            assert!(split.restricted_endpoints().is_empty());
+
+            profile.allowed_routes = vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()];
+            let active = vec![profile];
+            let full = generate(&active, &aggregate(&active));
+            let state = StateView {
+                local: local.parse().unwrap(),
+                remote: endpoint.parse().unwrap(),
+                transport: Transport::Udp,
+            };
+            assert!(should_delete_state(
+                &full,
+                state,
+                &split.restricted_endpoints()
+            ));
+            assert!(!should_delete_state(
+                &full,
+                state,
+                &full.restricted_endpoints()
+            ));
+        }
     }
 
     #[test]
@@ -564,7 +706,11 @@ mod tests {
             remote: "8.8.8.8:53".parse().unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Udp,
         };
-        assert!(should_delete_state(&policy, leaked_dns));
+        assert!(should_delete_state(
+            &policy,
+            leaked_dns,
+            &policy.endpoint_exceptions
+        ));
         let selected_but_physical = StateView {
             local: "192.168.1.10:40000"
                 .parse()
@@ -572,13 +718,21 @@ mod tests {
             remote: "10.0.0.53:53".parse().unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Udp,
         };
-        assert!(should_delete_state(&policy, selected_but_physical));
+        assert!(should_delete_state(
+            &policy,
+            selected_but_physical,
+            &policy.endpoint_exceptions
+        ));
         let selected_in_tunnel = StateView {
             local: "10.0.0.2:40000".parse().unwrap_or_else(|e| panic!("{e}")),
             remote: "10.0.0.53:53".parse().unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Udp,
         };
-        assert!(should_delete_state(&policy, selected_in_tunnel));
+        assert!(should_delete_state(
+            &policy,
+            selected_in_tunnel,
+            &policy.endpoint_exceptions
+        ));
         let unrelated = StateView {
             local: "192.168.1.10:40000"
                 .parse()
@@ -588,6 +742,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
             transport: Transport::Tcp,
         };
-        assert!(!should_delete_state(&policy, unrelated));
+        assert!(!should_delete_state(
+            &policy,
+            unrelated,
+            &policy.endpoint_exceptions
+        ));
     }
 }

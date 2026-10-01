@@ -95,6 +95,10 @@ Full-tunnel detection includes equivalent sets of smaller prefixes, such as
 `0.0.0.0/1` plus `128.0.0.0/1`. Such profiles require DNS just like `/0`
 profiles. The firewall also enables full lockdown when active profiles together
 cover an entire address family.
+While full lockdown is active, the selected DNS servers must have tunnel routes.
+A split profile may select an external resolver, but that resolver is blocked
+if no active tunnel covers it. This prevents DNS from bypassing full lockdown
+through the other IP family.
 
 Split tunnels also protect their configured destinations with firewall rules,
 even without a DNS section. Traffic to those destinations is blocked if it would

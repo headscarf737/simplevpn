@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(target_os = "macos")]
+mod route_refresh;
+
+#[cfg(target_os = "macos")]
 mod macos {
     use std::{
         collections::HashMap,
@@ -19,6 +22,7 @@ mod macos {
         time::{Instant, sleep_until},
     };
 
+    use super::route_refresh::RouteRefresh;
     use crate::{
         AppError, Result,
         config::Profile,
@@ -109,6 +113,7 @@ mod macos {
             journal: loaded,
             status_path,
             stale_recovery,
+            route_refresh: RouteRefresh::default(),
         };
         supervisor.publish_status()?;
         tracing::info!("supervisor initialized");
@@ -132,6 +137,7 @@ mod macos {
                 ClientFinished,
                 SessionsChanged,
                 RouteChange,
+                RefreshRoutes,
                 Signal,
                 Idle,
             }
@@ -140,7 +146,8 @@ mod macos {
                 Some(request) = request_rx.recv() => Event::Request(request),
                 Some(_) = clients.join_next(), if !clients.is_empty() => Event::ClientFinished,
                 _ = session_changes.changed() => Event::SessionsChanged,
-                _ = supervisor.runtime.route_changed() => Event::RouteChange,
+                Some(()) = supervisor.runtime.route_changed() => Event::RouteChange,
+                () = sleep_until(supervisor.route_refresh.deadline().unwrap_or_else(Instant::now)), if supervisor.route_refresh.deadline().is_some() => Event::RefreshRoutes,
                 _ = interrupt.recv() => Event::Signal,
                 _ = terminate.recv() => Event::Signal,
                 () = sleep_until(lifetime.idle_deadline.unwrap_or_else(Instant::now)), if lifetime.idle_deadline.is_some() => Event::Idle,
@@ -193,7 +200,12 @@ mod macos {
                         break;
                     }
                 }
-                Event::RouteChange => supervisor.recompute_after_default_route_change().await?,
+                Event::RouteChange => {
+                    if !supervisor.tunnels.is_empty() && !supervisor.stale_recovery {
+                        supervisor.route_refresh.request(Instant::now());
+                    }
+                }
+                Event::RefreshRoutes => supervisor.refresh_routes().await,
                 Event::Signal => {
                     if !supervisor.tunnels.is_empty()
                         && let Err(error) = supervisor.down_all().await
@@ -352,6 +364,7 @@ mod macos {
         journal: RecoveryJournal,
         status_path: &'a Path,
         stale_recovery: bool,
+        route_refresh: RouteRefresh,
     }
 
     impl Supervisor<'_> {
@@ -462,6 +475,7 @@ mod macos {
                 };
             }
             self.stale_recovery = false;
+            self.route_refresh.clear();
             self.publish_status()
         }
 
@@ -481,6 +495,7 @@ mod macos {
                 }
                 self.journal = RecoveryJournal::clean();
                 self.journal_store.save(&self.journal)?;
+                self.route_refresh.clear();
                 self.publish_status()?;
                 return Ok(());
             }
@@ -530,6 +545,7 @@ mod macos {
                 self.journal_store.save(&self.journal)?;
             }
             self.stale_recovery = false;
+            self.route_refresh.clear();
             self.publish_status()
         }
 
@@ -644,17 +660,35 @@ mod macos {
             self.publish_status()
         }
 
+        async fn refresh_routes(&mut self) {
+            if self.tunnels.is_empty() || self.stale_recovery {
+                self.route_refresh.clear();
+                return;
+            }
+            // A network change can temporarily invalidate routes. Keep the
+            // supervisor, tunnels and firewall alive while retrying, with the
+            // control loop free to serve requests between attempts.
+            let result = self.recompute_after_default_route_change().await;
+            self.route_refresh.complete(result, Instant::now());
+            if let Err(error) = self.publish_status() {
+                tracing::error!(%error, "cannot publish route refresh status");
+            }
+        }
+
         async fn recompute_after_default_route_change(&mut self) -> Result<()> {
             if self.tunnels.is_empty() {
                 return Ok(());
             }
             let active = self.active_profiles();
             let plan = aggregate(&active);
+            // Keep protection installed across the entire refresh and backoff.
+            // Reassert it and evict bypassing states before changing any route.
+            // A firewall failure stops this attempt before route mutation.
+            self.apply_journaled_firewall(&generate_firewall(&active, &plan))?;
             self.runtime.apply_routes(&plan.routes).await?;
             self.journal.record_routes(&plan.routes);
             self.journal.stage = TransitionStage::Dns;
-            self.journal_store.save(&self.journal)?;
-            self.publish_status()
+            self.journal_store.save(&self.journal)
         }
 
         fn active_profiles(&self) -> Vec<ActiveProfile> {
@@ -664,7 +698,11 @@ mod macos {
         fn status(&self, name: Option<&str>) -> Result<StatusReport> {
             let active = self.active_profiles();
             let plan = aggregate(&active);
-            let report = StatusReport::build(&active, &plan, self.stale_recovery).select(name);
+            let mut report = StatusReport::build(&active, &plan, self.stale_recovery);
+            if self.route_refresh.is_reconnecting() {
+                report.mark_reconnecting();
+            }
+            let report = report.select(name);
             if let Some(name) = name
                 && report.profiles.is_empty()
             {

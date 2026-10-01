@@ -16,7 +16,7 @@ public struct ActiveProfile: Decodable, Sendable, Equatable {
   public let state: State
 
   public enum State: String, Decodable, Sendable {
-    case connected, standby
+    case connected, reconnecting, standby
     case recoveryPending = "recovery_pending"
   }
 }
@@ -26,10 +26,13 @@ public struct ProfileRow: Sendable, Equatable {
   public let file: URL?
   public let state: ActiveProfile.State?
 
-  public var isActive: Bool { state == .connected || state == .standby }
+  public var isActive: Bool {
+    state == .connected || state == .reconnecting || state == .standby
+  }
   public var title: String {
     switch state {
     case .standby: "\(name) — Standby"
+    case .reconnecting: "\(name) — Reconnecting"
     case .recoveryPending: "\(name) — Recovery pending"
     default: name
     }

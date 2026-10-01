@@ -7,6 +7,7 @@ use std::{
 };
 
 use ipnetwork::IpNetwork;
+use system_configuration::network_configuration::{SCNetworkInterfaceType, get_interfaces};
 use talpid_routing::{RouteInfo, RouteManagerHandle};
 use tokio::time::{Duration, sleep};
 
@@ -103,26 +104,33 @@ pub async fn verify_routes(
     physical_v4: Option<u16>,
     physical_v6: Option<u16>,
 ) -> Result<()> {
+    let physical_interfaces = if desired
+        .iter()
+        .any(|route| matches!(route.target, RouteTarget::PhysicalDefault))
+    {
+        physical_interface_indices()
+    } else {
+        HashSet::new()
+    };
     for route in desired {
         let expected_interface = match &route.target {
-            RouteTarget::Tunnel { interface, .. } => interface_index(interface)?,
-            RouteTarget::PhysicalDefault => if route.prefix.is_ipv4() {
-                physical_v4
-            } else {
-                physical_v6
+            RouteTarget::Tunnel { interface, .. } => Some(interface_index(interface)?),
+            RouteTarget::PhysicalDefault => {
+                if route.prefix.is_ipv4() {
+                    physical_v4
+                } else {
+                    physical_v6
+                }
             }
-            .ok_or_else(|| {
-                verification_error(format!(
-                    "no physical default interface is available for route {}",
-                    route.prefix
-                ))
-            })?,
         };
         let actual = inspect_route(manager, route.prefix).await?.ok_or_else(|| {
             verification_error(format!("route {} was not installed", route.prefix))
         })?;
-        if actual.prefix != route.prefix || actual.interface_index != expected_interface {
-            let expected_interface = interface_label(expected_interface);
+        if !route_matches(&actual, route, expected_interface, &physical_interfaces) {
+            let expected_interface = match &route.target {
+                RouteTarget::Tunnel { interface, .. } => interface.clone(),
+                RouteTarget::PhysicalDefault => "a physical network interface".to_owned(),
+            };
             return Err(verification_error(format!(
                 "route {} resolved as {} on {}, expected {} on {expected_interface}",
                 route.prefix,
@@ -159,6 +167,46 @@ pub async fn verify_routes(
         }
     }
     Ok(())
+}
+
+fn physical_interface_indices() -> HashSet<u16> {
+    get_interfaces()
+        .iter()
+        .filter(|interface| {
+            matches!(
+                interface.interface_type(),
+                Some(
+                    SCNetworkInterfaceType::Ethernet
+                        | SCNetworkInterfaceType::IEEE80211
+                        | SCNetworkInterfaceType::FireWire
+                        | SCNetworkInterfaceType::WWAN
+                        | SCNetworkInterfaceType::Bond
+                        | SCNetworkInterfaceType::Bridge
+                        | SCNetworkInterfaceType::VLAN
+                )
+            )
+        })
+        .filter_map(|interface| interface.bsd_name())
+        // Interfaces can disappear during unplug/wake. A missing index must
+        // never become an accepted route target.
+        .filter_map(|name| interface_index(&name.to_string()).ok())
+        .collect()
+}
+
+fn route_matches(
+    actual: &RouteInfo,
+    desired: &PlannedRoute,
+    preferred_interface: Option<u16>,
+    physical_interfaces: &HashSet<u16>,
+) -> bool {
+    // Talpid's DefaultNode chooses a gateway, not a binding to the preferred
+    // interface. An encrypted peer route may legitimately use the other link
+    // when Ethernet and Wi-Fi share a router. Tunnel destinations remain exact.
+    actual.prefix == desired.prefix
+        && actual.interface_index != 0
+        && (preferred_interface == Some(actual.interface_index)
+            || (matches!(desired.target, RouteTarget::PhysicalDefault)
+                && physical_interfaces.contains(&actual.interface_index)))
 }
 
 fn route_conflicts(existing: &RouteInfo, desired: &PlannedRoute) -> bool {
@@ -384,6 +432,81 @@ fn verification_error(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use crate::planner::RoutePurpose;
+
+    #[test]
+    fn endpoint_route_can_use_wifi_while_ethernet_is_preferred() {
+        for prefix in ["192.0.2.1/32", "2001:db8::1/128"] {
+            let prefix = prefix.parse().unwrap();
+            let desired = PlannedRoute {
+                prefix,
+                target: RouteTarget::PhysicalDefault,
+                purpose: RoutePurpose::EndpointException,
+            };
+            let actual = RouteInfo {
+                prefix,
+                interface_index: 14, // en0; preferred en7 is index 18.
+                was_cloned: false,
+            };
+            let physical = HashSet::from([14, 18]);
+            assert!(route_matches(&actual, &desired, Some(18), &physical));
+            assert!(route_matches(&actual, &desired, None, &physical));
+            // Other platform-supported uplinks still work via Talpid's default.
+            assert!(route_matches(&actual, &desired, Some(14), &HashSet::new()));
+        }
+    }
+
+    #[test]
+    fn endpoint_verification_rejects_missing_unknown_and_tunnel_interfaces_and_wrong_prefixes() {
+        let desired = PlannedRoute {
+            prefix: "192.0.2.1/32".parse().unwrap(),
+            target: RouteTarget::PhysicalDefault,
+            purpose: RoutePurpose::EndpointException,
+        };
+        let physical = HashSet::from([14, 18]);
+        for interface_index in [0, 1, 22, 999] {
+            let actual = RouteInfo {
+                prefix: desired.prefix,
+                interface_index,
+                was_cloned: false,
+            };
+            assert!(!route_matches(&actual, &desired, Some(18), &physical));
+        }
+        let covering_route = RouteInfo {
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            interface_index: 14,
+            was_cloned: false,
+        };
+        assert!(!route_matches(
+            &covering_route,
+            &desired,
+            Some(18),
+            &physical
+        ));
+    }
+
+    #[test]
+    fn tunnel_routes_still_require_the_exact_assigned_interface() {
+        let desired = PlannedRoute {
+            prefix: "192.0.2.0/24".parse().unwrap(),
+            target: RouteTarget::Tunnel {
+                profile: "work".into(),
+                interface: "utun5".into(),
+            },
+            purpose: RoutePurpose::AllowedIp,
+        };
+        let physical = HashSet::from([14, 18]);
+        for interface_index in [0, 14, 18, 22, 23] {
+            let actual = RouteInfo {
+                prefix: desired.prefix,
+                interface_index,
+                was_cloned: false,
+            };
+            assert_eq!(
+                route_matches(&actual, &desired, Some(23), &physical),
+                interface_index == 23
+            );
+        }
+    }
 
     #[test]
     fn parses_ifconfig_state() {

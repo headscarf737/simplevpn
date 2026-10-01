@@ -71,9 +71,6 @@ impl MacRuntime {
 
     pub async fn apply_routes(&mut self, routes: &[PlannedRoute]) -> Result<()> {
         verify::reject_route_conflicts(&self.routes, routes, &self.applied_routes).await?;
-        let (default_v4, default_v6) = self.routes.get_default_routes().await.map_err(|error| {
-            AppError::Runtime(format!("cannot inspect physical default routes: {error}"))
-        })?;
         let previous = self.applied_routes.clone();
         self.routes.clear_routes().map_err(|error| {
             AppError::Runtime(format!(
@@ -91,6 +88,11 @@ impl MacRuntime {
                     format_error_chain(&error)
                 ))
             })?;
+        // Defaults may change while macOS switches between Ethernet and Wi-Fi.
+        // Use the post-write defaults for verification, not a stale snapshot.
+        let (default_v4, default_v6) = self.routes.get_default_routes().await.map_err(|error| {
+            AppError::Runtime(format!("cannot inspect physical default routes: {error}"))
+        })?;
         verify::verify_routes(
             &self.routes,
             routes,

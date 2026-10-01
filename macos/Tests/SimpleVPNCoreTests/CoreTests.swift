@@ -493,6 +493,29 @@ private actor StubClient: VPNClient {
   #expect(!model.canDisconnectAll)
 }
 
+@Test @MainActor func reconnectingProfilesRemainDisconnectable() async throws {
+  let data = Data(
+    #"{"profiles":[{"name":"work","state":"reconnecting"}],"recovery_pending":false}"#.utf8)
+  let reconnecting = try JSONDecoder().decode(VPNStatus.self, from: data)
+  for disconnectAll in [false, true] {
+    let client = StubClient([.success(reconnecting), .success(status())])
+    let model = MenuController(client: client, discover: { [:] })
+    await model.refresh()
+    #expect(model.summary == "Reconnecting VPN…")
+    #expect(model.canToggle && model.canDisconnectAll)
+    #expect(model.rows.first?.isActive == true)
+    #expect(model.rows.first?.title == "work — Reconnecting")
+    if disconnectAll {
+      await model.disconnectAll()
+      #expect(await client.actions == [.disconnectAll])
+    } else {
+      await model.toggle("work")
+      #expect(await client.actions == [.disconnect("work")])
+    }
+    #expect(model.summary == "No active profiles")
+  }
+}
+
 @Test @MainActor func statusFailureDisablesActionsAndRecoversOnRefresh() async {
   let client = StubClient([
     .success(status([("work", .connected)])),

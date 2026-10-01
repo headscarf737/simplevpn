@@ -137,7 +137,7 @@ async fn concurrent_split_and_full_tunnels_transition_and_clean_up() {
     }
     assert!(pf_enabled());
     let pf_rules = command_output("/sbin/pfctl", &["-a", "simplevpn", "-sr"]);
-    assert_interface_passes_are_stateless(&pf_rules);
+    assert_leak_protection_rules(&pf_rules);
     assert!(pf_rules.lines().any(|line| line.contains("block")));
     assert!(pf_rules.lines().any(|line| line.contains("pass")));
     let scrub_rules = command_output("/sbin/pfctl", &["-a", "simplevpn-scrub", "-sr"]);
@@ -368,7 +368,7 @@ async fn assert_site_internet_mode(
         assert!(dns.contains(site_search_domain));
     }
     let rules = command_output("/sbin/pfctl", &["-a", "simplevpn", "-sr"]);
-    assert_interface_passes_are_stateless(&rules);
+    assert_leak_protection_rules(&rules);
     assert!(
         rules
             .lines()
@@ -380,7 +380,21 @@ async fn assert_site_internet_mode(
     assert_eq!(ipv6_block, internet.is_none());
 }
 
-fn assert_interface_passes_are_stateless(rules: &str) {
+fn assert_leak_protection_rules(rules: &str) {
+    let mut endpoints = 0;
+    for rule in rules.lines().filter(|rule| {
+        rule.starts_with("pass out")
+            && rule.contains("proto udp")
+            && rule.contains("keep state")
+            && !rule.contains(" on ")
+    }) {
+        assert!(
+            rule.contains("user = root") || rule.contains("user = 0"),
+            "endpoint exception must require a root-owned socket: {rule}"
+        );
+        endpoints += 1;
+    }
+    assert!(endpoints > 0, "no endpoint exceptions found in PF rules");
     for rule in rules.lines().filter(|rule| rule.starts_with("pass")) {
         if rule.contains(" on utun") || rule.contains("port = 53") || rule.contains("port = domain")
         {

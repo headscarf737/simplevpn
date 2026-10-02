@@ -95,6 +95,8 @@ impl MacRuntime {
                 "cannot clear the previous Talpid route plan: {error}"
             ))
         })?;
+        verify::remove_owned_routes(&self.routes, previous.iter().map(|route| route.prefix))
+            .await?;
         verify::remove_route_clones(&self.routes, routes).await?;
         let required: HashSet<_> = routes.iter().map(required_route).collect();
         self.add_routes_with_retry(required)
@@ -210,6 +212,16 @@ impl MacRuntime {
         self.routes.clear_routes().map_err(|error| {
             AppError::Runtime(format!("cannot restore physical default routes: {error}"))
         })?;
+        let prefixes = journal
+            .routes
+            .iter()
+            .map(|route| {
+                route.prefix.parse().map_err(|error| {
+                    AppError::Runtime(format!("invalid route in journal: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        verify::remove_owned_routes(&self.routes, prefixes).await?;
         // A read command sent after `clear_routes` is an acknowledgement fence for Talpid's
         // otherwise fire-and-forget cleanup command.
         let (default_v4, default_v6) = self.routes.get_default_routes().await.map_err(|error| {
@@ -264,6 +276,14 @@ impl MacRuntime {
             errors.push(format!(
                 "cannot await route cleanup while stopping: {error}"
             ));
+        }
+        if let Err(error) = verify::remove_owned_routes(
+            &self.routes,
+            previous_routes.iter().map(|route| route.prefix),
+        )
+        .await
+        {
+            errors.push(error.to_string());
         }
         if let Err(error) =
             verify::verify_routes(&self.routes, &[], &previous_routes, None, None).await

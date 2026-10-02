@@ -395,13 +395,8 @@ impl RouteManagerImpl {
         match message {
             Ok(RouteSocketMessage::DeleteRoute(route)) => {
                 // Forget about applied route, if relevant
-                match RouteDestination::try_from(&route).map_err(Error::InvalidData) {
-                    Ok(destination) => {
-                        self.applied_routes.remove(&destination);
-                    }
-                    Err(err) => {
-                        log::error!("Failed to process deleted route: {err}");
-                    }
+                if let Err(err) = forget_deleted_route(&mut self.applied_routes, &route) {
+                    log::error!("Failed to process deleted route: {err}");
                 }
                 if route.errno() != 0 {
                     return;
@@ -663,17 +658,18 @@ impl RouteManagerImpl {
             return Ok(false);
         }
 
-        let destination = RouteDestination::try_from(&route).map_err(Error::InvalidData)?;
         match self.routing_table.delete_route(&route).await {
             Ok(()) => {
-                self.applied_routes.remove(&destination);
-                self.non_tunnel_routes.remove(&prefix);
-                if prefix.prefix() == 0 {
-                    self.tunnel_default_routes.remove(if prefix.is_ipv4() {
-                        interface::Family::V4
-                    } else {
-                        interface::Family::V6
-                    });
+                forget_deleted_route(&mut self.applied_routes, &route)?;
+                if !route.was_cloned() {
+                    self.non_tunnel_routes.remove(&prefix);
+                    if prefix.prefix() == 0 {
+                        self.tunnel_default_routes.remove(if prefix.is_ipv4() {
+                            interface::Family::V4
+                        } else {
+                            interface::Family::V6
+                        });
+                    }
                 }
                 Ok(true)
             }
@@ -855,6 +851,21 @@ fn exact_route(route: Option<RouteMessage>, prefix: IpNetwork) -> Result<Option<
     }
 }
 
+fn forget_deleted_route(
+    applied_routes: &mut BTreeMap<RouteDestination, RouteMessage>,
+    deleted: &RouteMessage,
+) -> Result<()> {
+    // A cached host and its static /32 or /128 parent can have the same
+    // RouteDestination. Expiring the clone does not delete the owned parent.
+    // Failed delete notifications likewise must not discard cleanup ownership.
+    if deleted.errno() != 0 || deleted.was_cloned() {
+        return Ok(());
+    }
+    let destination = RouteDestination::try_from(deleted).map_err(Error::InvalidData)?;
+    applied_routes.remove(&destination);
+    Ok(())
+}
+
 /// Construct a [RouteMessage] that refers to the `0.0.0.0/0` or `::/0` route with the
 /// RTF_GATEAWAY-flag set. Used to reference the default route created by macOS.
 fn default_route_msg(family: interface::Family) -> RouteMessage {
@@ -871,6 +882,58 @@ fn route_matches_interface(default_route: &RouteMessage, interface_route: &Route
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_an_endpoint_clone_preserves_static_parent_ownership() {
+        for (prefix, gateway) in [
+            ("192.0.2.1/32", "192.0.2.254:0"),
+            ("2001:db8::1/128", "[2001:db8::ffff]:0"),
+        ] {
+            let prefix: IpNetwork = prefix.parse().unwrap();
+            let gateway: SocketAddr = gateway.parse().unwrap();
+            let parent =
+                RouteMessage::new_route(Destination::Network(prefix)).set_gateway_addr(gateway);
+            let cloned = RouteMessage::new_route(Destination::Host(prefix.ip()))
+                .set_gateway_addr(gateway)
+                .set_interface_index(14)
+                .append_route_flag(data::RouteFlag::RTF_WASCLONED);
+            let destination = RouteDestination::try_from(&parent).unwrap();
+            assert!(destination == RouteDestination::try_from(&cloned).unwrap());
+            let mut applied = BTreeMap::from([(destination.clone(), parent.clone())]);
+
+            forget_deleted_route(&mut applied, &cloned).unwrap();
+            assert_eq!(applied.get(&destination), Some(&parent));
+
+            forget_deleted_route(&mut applied, &parent).unwrap();
+            assert!(applied.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_delete_notification_preserves_cleanup_ownership() {
+        let parent = RouteMessage::new_route(Destination::Network("192.0.2.1/32".parse().unwrap()));
+        let destination = RouteDestination::try_from(&parent).unwrap();
+        let mut applied = BTreeMap::from([(destination.clone(), parent.clone())]);
+        let (mut header, payload) = parent.payload(data::MessageType::RTM_DELETE, 1, 1);
+        header.rtm_errno = libc::ESRCH;
+        let mut buffer = vec![0; usize::from(header.rtm_msglen)];
+        // SAFETY: the destination is at least the size of this route header.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&raw const header).cast::<u8>(),
+                buffer.as_mut_ptr(),
+                std::mem::size_of_val(&header),
+            );
+        }
+        buffer[std::mem::size_of_val(&header)..].copy_from_slice(&payload.concat());
+        let RouteSocketMessage::DeleteRoute(failed) =
+            RouteSocketMessage::parse_message(&buffer).unwrap()
+        else {
+            panic!("expected delete notification");
+        };
+        forget_deleted_route(&mut applied, &failed).unwrap();
+        assert_eq!(applied.get(&destination), Some(&parent));
+    }
 
     #[test]
     fn route_info_supports_ipv4_ipv6_defaults_hosts_and_cloned_routes() {

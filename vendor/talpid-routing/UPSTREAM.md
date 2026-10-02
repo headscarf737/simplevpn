@@ -16,6 +16,9 @@ Local changes retained on top of this revision:
   handling, and regression tests for these extensions.
 - Unaligned route-header reads and bounds checks for declared message lengths
   and socket-address padding, with malformed-input regression tests.
+- Preserve static-route ownership when a kernel clone with the same destination
+  expires or a delete notification reports failure. Explicit clone removal also
+  preserves the parent's ownership and desired endpoint route.
 - Formatting with the repository's pinned Rust toolchain.
 
 Upstream's `remove_routes` API is retained alongside the local removal APIs.

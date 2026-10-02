@@ -260,6 +260,48 @@ pub async fn remove_route_clones(
     Ok(())
 }
 
+pub async fn remove_owned_routes(
+    manager: &RouteManagerHandle,
+    prefixes: impl IntoIterator<Item = IpNetwork>,
+) -> Result<()> {
+    remove_owned_routes_with(prefixes, async |prefix| {
+        manager.remove_route(prefix).await.map_err(|error| {
+            AppError::Runtime(format!(
+                "cannot remove owned route {prefix}: {}",
+                crate::error::format_error_chain(&error)
+            ))
+        })
+    })
+    .await
+}
+
+async fn remove_owned_routes_with(
+    prefixes: impl IntoIterator<Item = IpNetwork>,
+    mut remove: impl AsyncFnMut(IpNetwork) -> Result<bool>,
+) -> Result<()> {
+    const MAX_REMOVALS: usize = 3;
+
+    for prefix in prefixes {
+        // Talpid restores physical defaults during clear_routes. Never remove
+        // those using the old plan's /0 entries.
+        if prefix.prefix() == 0 {
+            continue;
+        }
+        // Talpid's record can lose a static endpoint route when a clone with
+        // the same destination expires. Use our independent ownership record,
+        // and allow a clone to be removed before its underlying static route.
+        // remove_route only deletes exact prefixes, never a covering route.
+        for _ in 0..MAX_REMOVALS {
+            if !remove(prefix).await? {
+                break;
+            }
+        }
+    }
+    // Callers still verify the resulting plan. Repeatedly recreated clones
+    // must not make cleanup unbounded or permit a stale static route to pass.
+    Ok(())
+}
+
 pub async fn verify_routes_removed(
     manager: &RouteManagerHandle,
     routes: &[crate::journal::JournalRoute],
@@ -451,6 +493,48 @@ fn verification_error(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use crate::planner::RoutePurpose;
+
+    #[tokio::test]
+    async fn cleanup_removes_a_clone_and_its_static_parent_but_preserves_defaults() {
+        for (endpoint, default) in [("192.0.2.1/32", "0.0.0.0/0"), ("2001:db8::1/128", "::/0")] {
+            let endpoint: IpNetwork = endpoint.parse().unwrap();
+            let default: IpNetwork = default.parse().unwrap();
+            let mut remaining = std::collections::VecDeque::from(["clone", "static parent"]);
+            let mut removed = Vec::new();
+            remove_owned_routes_with([default, endpoint], async |prefix| {
+                assert_eq!(prefix, endpoint, "must not delete the restored default");
+                let route = remaining.pop_front();
+                removed.push(route);
+                Ok(route.is_some())
+            })
+            .await
+            .unwrap();
+            assert_eq!(removed, [Some("clone"), Some("static parent"), None]);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_bounds_recreated_clones_and_propagates_delete_failures() {
+        let endpoint: IpNetwork = "192.0.2.1/32".parse().unwrap();
+        let mut calls = 0;
+        remove_owned_routes_with([endpoint], async |_| {
+            calls += 1;
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls, 3,
+            "continuing traffic must not prevent cleanup from returning"
+        );
+
+        let error = remove_owned_routes_with([endpoint], async |_| {
+            Err(AppError::Runtime("delete denied".into()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "delete denied");
+    }
 
     #[test]
     fn recovery_accepts_recreated_endpoint_clones_on_either_physical_link() {
